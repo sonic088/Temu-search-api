@@ -1,15 +1,16 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cimport CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import sqlite3
 import json
 import os
 import random
+import httpx
 
 app = FastAPI(title="Temu Search API")
 
-# ─── CORS - مهم جداً عشان Frontend يقدر يتصل ───
+# CORS - مهم جداً عشان Frontend يقدر يتصل
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,7 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Database Setup ───
+# Database Setup
 DB_FILE = "temu_products.db"
 
 def init_db():
@@ -47,7 +48,7 @@ def init_db():
 
 init_db()
 
-# ─── Models ───
+# Models
 class SearchRequest(BaseModel):
     query: str
     max_results: int = 20
@@ -68,9 +69,8 @@ class SearchResponse(BaseModel):
     products: List[Product]
     source: str
 
-# ─── Mock Data Generator ───
+# Mock Data Generator (احتياطي)
 def generate_mock_products(query: str, count: int = 10) -> List[dict]:
-    """Generate realistic mock products when scraping fails"""
     categories = {
         "shirt": ["Cotton T-Shirt", "Polo Shirt", "Dress Shirt", "Flannel Shirt", "Tank Top"],
         "dress": ["Summer Dress", "Evening Gown", "Casual Dress", "Maxi Dress", "Mini Dress"],
@@ -78,16 +78,13 @@ def generate_mock_products(query: str, count: int = 10) -> List[dict]:
         "shoes": ["Running Shoes", "Casual Sneakers", "Leather Boots", "Sandals", "Slippers"],
         "bag": ["Backpack", "Handbag", "Crossbody Bag", "Tote Bag", "Wallet"],
     }
-
     base_names = categories.get(query.lower(), ["Product", "Item", "Accessory", "Gadget", "Tool"])
     products = []
-
     for i in range(count):
         base = random.choice(base_names)
         price = round(random.uniform(5, 80), 2)
         original = round(price * random.uniform(1.2, 2.5), 2)
         discount = round(((original - price) / original) * 100)
-
         products.append({
             "name": f"{base} - Premium Quality {i+1}",
             "price": f"${price:.2f}",
@@ -98,10 +95,100 @@ def generate_mock_products(query: str, count: int = 10) -> List[dict]:
             "sold_count": f"{random.randint(100, 9999)}+ sold",
             "product_url": f"https://temu.com/product/{query}-{i+1}"
         })
+    return products
+
+# ScrapingAnt Scraper
+async def scrape_with_scrapingant(query: str, max_results: int = 20):
+    """Scrape Temu using ScrapingAnt API"""
+    api_key = os.getenv("SCRAPINGANT_API_KEY", "")
+    if not api_key:
+        print("No SCRAPINGANT_API_KEY found, using mock data")
+        return None
+
+    search_url = f"https://www.temu.com/search_result.html?search_key={query}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                "https://api.scrapingant.com/v2/general",
+                params={
+                    "url": search_url,
+                    "x-api-key": api_key,
+                    "proxy_country": "US",
+                    "wait_for_selector": "[data-testid=\'goodsItem\']",
+                    "browser": "true"
+                }
+            )
+
+            if response.status_code != 200:
+                print(f"ScrapingAnt error: {response.status_code}")
+                return None
+
+            html = response.text
+            # Parse HTML to extract products (simplified)
+            products = parse_temu_html(html, query, max_results)
+            return products
+
+    except Exception as e:
+        print(f"ScrapingAnt failed: {e}")
+        return None
+
+def parse_temu_html(html: str, query: str, max_results: int) -> List[dict]:
+    """Parse Temu HTML to extract product data"""
+    import re
+    products = []
+
+    # Try to find product data in the HTML
+    # Temu stores product data in JSON within the page
+    json_matches = re.findall(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', html, re.DOTALL)
+
+    if json_matches:
+        try:
+            data = json.loads(json_matches[0])
+            # Extract products from the JSON structure
+            goods_list = data.get("goodsList", []) or data.get("data", {}).get("goodsList", [])
+
+            for item in goods_list[:max_results]:
+                products.append({
+                    "name": item.get("goodsName", "Unknown Product"),
+                    "price": f"${item.get('salePrice', '0')}",
+                    "original_price": f"${item.get('marketPrice', '')}" if item.get('marketPrice') else None,
+                    "discount": f"-{item.get('discount', '')}%" if item.get('discount') else None,
+                    "image": item.get("thumbUrl", "") or item.get("imageUrl", ""),
+                    "rating": str(item.get("averageStar", "")) if item.get("averageStar") else None,
+                    "sold_count": f"{item.get('salesVolume', '')}+ sold" if item.get('salesVolume') else None,
+                    "product_url": f"https://www.temu.com{item.get('linkUrl', '')}" if item.get('linkUrl') else None
+                })
+        except Exception as e:
+            print(f"JSON parse error: {e}")
+
+    # Fallback: regex extraction
+    if not products:
+        # Extract product cards using regex
+        product_blocks = re.findall(r'<div[^>]*data-testid="goodsItem"[^>]*>(.*?)</div>\s*</div>\s*</div>', html, re.DOTALL)
+
+        for block in product_blocks[:max_results]:
+            try:
+                name = re.search(r'class="goods-name"[^>]*>(.*?)</span>', block)
+                price = re.search(r'class="goods-price"[^>]*>(.*?)</span>', block)
+                img = re.search(r'<img[^>]*src="([^"]+)"', block)
+
+                products.append({
+                    "name": name.group(1).strip() if name else f"{query} Product",
+                    "price": price.group(1).strip() if price else "$9.99",
+                    "original_price": None,
+                    "discount": None,
+                    "image": img.group(1) if img else "",
+                    "rating": None,
+                    "sold_count": None,
+                    "product_url": None
+                })
+            except:
+                continue
 
     return products
 
-# ─── Database Functions ───
+# Database Functions
 def get_cached_results(query: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -151,13 +238,14 @@ def get_products_by_query(query: str):
     conn.close()
     return [dict(row) for row in rows]
 
-# ─── API Endpoints ───
+# API Endpoints
 @app.get("/")
 async def root():
     return {
         "message": "Temu Search API is running",
         "docs": "/docs",
-        "endpoints": ["/search", "/products", "/recommendations/{query}"]
+        "endpoints": ["/search", "/products", "/recommendations/{query}"],
+        "scraper": "scrapingant" if os.getenv("SCRAPINGANT_API_KEY") else "mock"
     }
 
 @app.post("/search", response_model=SearchResponse)
@@ -176,56 +264,16 @@ async def search(request: SearchRequest):
             source="cache"
         )
 
-    # 2. Try Playwright scraping (will likely fail on Render Free Tier)
-    products = []
-    try:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-            )
-            context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            )
-            page = await context.new_page()
+    # 2. Try ScrapingAnt
+    products = await scrape_with_scrapingant(query, request.max_results)
+    source = "scrapingant"
 
-            search_url = f"https://www.temu.com/search_result.html?search_key={query}"
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_selector('[data-testid="goodsItem"]', timeout=10000)
-
-            items = await page.query_selector_all('[data-testid="goodsItem"]')
-
-            for item in items[:request.max_results]:
-                try:
-                    name_el = await item.query_selector('.goods-name')
-                    price_el = await item.query_selector('.goods-price')
-                    img_el = await item.query_selector('img')
-
-                    name = await name_el.inner_text() if name_el else "Unknown"
-                    price = await price_el.inner_text() if price_el else "N/A"
-                    image = await img_el.get_attribute('src') if img_el else ""
-
-                    products.append({
-                        "name": name.strip(),
-                        "price": price.strip(),
-                        "original_price": None,
-                        "discount": None,
-                        "image": image,
-                        "rating": None,
-                        "sold_count": None,
-                        "product_url": None
-                    })
-                except:
-                    continue
-
-            await browser.close()
-    except Exception as e:
-        print(f"Scraping failed (expected on Render Free): {e}")
-        # Fallback to mock data
+    # 3. Fallback to mock data if ScrapingAnt fails
+    if not products:
         products = generate_mock_products(query, request.max_results)
+        source = "mock"
 
-    # 3. Save to database
+    # 4. Save to database
     if products:
         save_products(query, products)
         cache_results(query, products)
@@ -234,7 +282,7 @@ async def search(request: SearchRequest):
         query=query,
         total_results=len(products),
         products=products,
-        source="scraped" if len(products) > 0 and products[0].get("product_url") else "mock"
+        source=source
     )
 
 @app.get("/products")
@@ -243,14 +291,9 @@ async def get_all_products():
 
 @app.get("/recommendations/{query}")
 async def recommendations(query: str):
-    """AI-powered recommendations - currently uses simple sorting"""
     products = get_products_by_query(query)
-
     if not products:
-        # Generate mock if no data
         products = generate_mock_products(query, 10)
-
-    # Simple recommendation: sort by price (lower = better value)
     try:
         recommended = sorted(
             products,
@@ -258,7 +301,6 @@ async def recommendations(query: str):
         )[:3]
     except:
         recommended = products[:3]
-
     return {
         "query": query,
         "recommendations": recommended,
