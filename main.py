@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cimport CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import sqlite3
