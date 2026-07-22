@@ -4,7 +4,6 @@ import os
 
 app = Flask(__name__)
 
-# Oxylabs credentials from Render Environment Variables
 OX_USER = os.getenv("OX_USER", "")
 OX_PASS = os.getenv("OX_PASS", "")
 
