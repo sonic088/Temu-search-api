@@ -6,7 +6,6 @@ import sqlite3
 import json
 import os
 import httpx
-import re
 
 app = FastAPI(title='Temu Search API')
 
@@ -53,7 +52,7 @@ async def root():
         'message': 'Temu Search API is running',
         'docs': '/docs',
         'endpoints': ['/search', '/product-details', '/products'],
-        'version': '6.0'
+        'version': '7.0'
     }
 
 @app.post('/search')
@@ -69,70 +68,48 @@ async def search(request: SearchRequest):
     
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            # PREMIUM PROXY + JS RENDERING — يتجاوز Cloudflare
+            # AI EXTRACTION — يقرأ الصفحة كإنسان
             r = await client.get(
                 SCRAPINGBEE_URL,
                 params={
                     "api_key": SCRAPINGBEE_KEY,
                     "url": search_url,
                     "render_js": "true",
-                    "premium_proxy": "true",  # ← الحل السحري
-                    "wait": "8000",
-                    "block_resources": "false",
+                    "wait": "10000",
+                    "ai_extract_rules": json.dumps({
+                        "products": f"Extract a list of up to {request.max_results} products from this Temu search results page. For each product: name, price, original_price if shown, discount if shown, image URL, rating if shown, number of sold items if shown, and product URL"
+                    })
                 }
             )
             
             if r.status_code != 200:
                 raise HTTPException(status_code=503, detail=f'ScrapingBee error: {r.status_code}')
             
-            html = r.text
-            
-            # استخراج المنتجات من HTML مباشرة (regex)
-            products = []
-            
-            # Temu يستخدم JSON مضمن في الصفحة
-            json_matches = re.findall(r'window\._SSR_HYDRATED_DATA\s*=\s*({.+?});', html)
-            if json_matches:
-                try:
-                    data = json.loads(json_matches[0])
-                    items = data.get('searchResult', {}).get('data', [])
-                    for item in items[:request.max_results]:
-                        products.append({
-                            'name': item.get('title', 'Unknown'),
-                            'price': item.get('price', '$0'),
-                            'original_price': item.get('market_price'),
-                            'discount': f"-{item.get('discount')}" if item.get('discount') else None,
-                            'image': item.get('thumb_url', ''),
-                            'rating': str(item.get('rating')) if item.get('rating') else None,
-                            'sold_count': item.get('sold_count'),
-                            'product_url': f"https://www.temu.com{item.get('url', '')}" if item.get('url') else ''
-                        })
-                except:
-                    pass
-            
-            # Fallback: regex على HTML
-            if not products:
-                titles = re.findall(r'"title":"([^"]+)"', html)
-                prices = re.findall(r'"price":"([^"]+)"', html)
-                images = re.findall(r'"thumb_url":"([^"]+)"', html)
-                urls = re.findall(r'"url":"(/[^"]+)"', html)
-                
-                for i in range(min(len(titles), request.max_results)):
-                    products.append({
-                        'name': titles[i] if i < len(titles) else 'Unknown',
-                        'price': prices[i] if i < len(prices) else '$0',
-                        'image': images[i] if i < len(images) else '',
-                        'product_url': f"https://www.temu.com{urls[i]}" if i < len(urls) else '',
-                    })
+            data = r.json()
+            products = data.get('products', [])
             
             if not products:
-                raise HTTPException(status_code=503, detail='No products found. Temu may be blocking.')
+                raise HTTPException(status_code=503, detail='No products found')
+            
+            # Clean up
+            cleaned = []
+            for p in products:
+                cleaned.append({
+                    'name': p.get('name', 'Unknown'),
+                    'price': p.get('price', '$0'),
+                    'original_price': p.get('original_price'),
+                    'discount': p.get('discount'),
+                    'image': p.get('image_url') or p.get('image', ''),
+                    'rating': p.get('rating'),
+                    'sold_count': p.get('sold_count') or p.get('number_of_sold_items'),
+                    'product_url': p.get('product_url') or p.get('url', ''),
+                })
             
             return {
                 'query': query,
-                'total_results': len(products),
-                'products': products,
-                'source': 'scrapingbee_premium'
+                'total_results': len(cleaned),
+                'products': cleaned,
+                'source': 'scrapingbee_ai'
             }
             
     except HTTPException:
@@ -156,52 +133,29 @@ async def product_details(url: str):
                     "api_key": SCRAPINGBEE_KEY,
                     "url": url,
                     "render_js": "true",
-                    "premium_proxy": "true",  # ← الحل السحري
-                    "wait": "8000",
+                    "wait": "10000",
+                    "ai_extract_rules": json.dumps({
+                        "title": "Product title/name",
+                        "price": "Current selling price",
+                        "original_price": "Original price before discount",
+                        "discount": "Discount percentage",
+                        "images": "All product image URLs as a list",
+                        "description": "Full product description",
+                        "sizes": "Available sizes as a list",
+                        "colors": "Available colors as a list",
+                        "rating": "Product rating/stars",
+                        "sold_count": "Number of items sold",
+                        "reviews": "Customer reviews as a list of {user, text, rating}"
+                    })
                 }
             )
             
             if r.status_code != 200:
                 raise HTTPException(status_code=503, detail=f'ScrapingBee error: {r.status_code}')
             
-            html = r.text
-            
-            # استخراج من JSON مضمن
-            product = {
-                'name': 'Unknown',
-                'price': '$0',
-                'image': '',
-                'images': [],
-                'description': '',
-                'sizes': [],
-                'colors': [],
-            }
-            
-            json_matches = re.findall(r'window\._SSR_HYDRATED_DATA\s*=\s*({.+?});', html)
-            if json_matches:
-                try:
-                    data = json.loads(json_matches[0])
-                    p = data.get('goods', {})
-                    product = {
-                        'name': p.get('title', 'Unknown'),
-                        'price': p.get('price', '$0'),
-                        'original_price': p.get('market_price'),
-                        'discount': p.get('discount'),
-                        'image': p.get('thumb_url', ''),
-                        'images': p.get('thumb_url_list', []),
-                        'description': p.get('description', ''),
-                        'sizes': [s.get('name') for s in p.get('specs', []) if s.get('name')],
-                        'colors': [c.get('name') for c in p.get('specs', []) if c.get('name')],
-                        'rating': str(p.get('rating')) if p.get('rating') else None,
-                        'sold_count': p.get('sold_count'),
-                        'product_url': url,
-                    }
-                except:
-                    pass
-            
             return {
-                'source': 'scrapingbee_premium',
-                'product': product
+                'source': 'scrapingbee_ai',
+                'product': r.json()
             }
     except HTTPException:
         raise
