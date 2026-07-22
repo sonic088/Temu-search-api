@@ -65,10 +65,10 @@ class SearchResponse(BaseModel):
     source: str
 
 SCRAPINGBEE_KEY = os.getenv('SCRAPINGBEE_API_KEY', '')
+PARSE_API_KEY = os.getenv('PARSE_API_KEY', '')  # may be empty now
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 
 async def scrape_temu_search(query: str, limit: int = 20):
-    """البحث في Temu عبر ScrapingBee"""
     if not SCRAPINGBEE_KEY:
         return None
     search_url = f"https://www.temu.com/search_result.html?search_key={query}"
@@ -98,11 +98,10 @@ async def scrape_temu_search(query: str, limit: int = 20):
                 }
             )
             if r.status_code != 200:
-                print(f"ScrapingBee search error: {r.status_code}")
+                print(f"ScrapingBee search error: {r.status_code} - {r.text[:200]}")
                 return None
             data = r.json()
             products = data.get('products', [])
-            # Clean up URLs
             for p in products:
                 if p.get('product_url') and not p['product_url'].startswith('http'):
                     p['product_url'] = 'https://www.temu.com' + p['product_url']
@@ -112,7 +111,6 @@ async def scrape_temu_search(query: str, limit: int = 20):
         return None
 
 async def fetch_product_details(temu_url: str):
-    """جلب تفاصيل المنتج"""
     if not SCRAPINGBEE_KEY:
         return None
     try:
@@ -197,9 +195,20 @@ async def root():
     return {
         'message': 'Temu Search API is running',
         'docs': '/docs',
-        'endpoints': ['/search', '/product-details', '/products'],
+        'endpoints': ['/search', '/product-details', '/products', '/debug'],
         'scraper': 'scrapingbee_only',
-        'version': '4.0'
+        'version': '4.1'
+    }
+
+@app.get('/debug')
+async def debug():
+    """نقطة فحص: تُظهر أسماء المتغيرات المتاحة (بدون قيم)"""
+    env_names = list(os.environ.keys())
+    return {
+        'env_var_names': env_names,
+        'has_scrapingbee': 'SCRAPINGBEE_API_KEY' in os.environ,
+        'scrapingbee_length': len(SCRAPINGBEE_KEY),
+        'has_parse': 'PARSE_API_KEY' in os.environ,
     }
 
 @app.post('/search', response_model=SearchResponse)
