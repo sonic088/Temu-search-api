@@ -43,235 +43,161 @@ class SearchRequest(BaseModel):
     query: str
     max_results: int = 20
 
-class Product(BaseModel):
-    name: str
-    price: str
-    original_price: Optional[str] = None
-    discount: Optional[str] = None
-    image: str
-    images: Optional[List[str]] = None
-    rating: Optional[str] = None
-    sold_count: Optional[str] = None
-    product_url: Optional[str] = None
-    description: Optional[str] = None
-    sizes: Optional[List[str]] = None
-    colors: Optional[List[str]] = None
-    reviews: Optional[List[dict]] = None
-
-class SearchResponse(BaseModel):
-    query: str
-    total_results: int
-    products: List[Product]
-    source: str
-
 SCRAPINGBEE_KEY = os.getenv('SCRAPINGBEE_API_KEY', '')
-PARSE_API_KEY = os.getenv('PARSE_API_KEY', '')  # may be empty now
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
-
-async def scrape_temu_search(query: str, limit: int = 20):
-    if not SCRAPINGBEE_KEY:
-        return None
-    search_url = f"https://www.temu.com/search_result.html?search_key={query}"
-    try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            r = await client.get(
-                SCRAPINGBEE_URL,
-                params={
-                    "api_key": SCRAPINGBEE_KEY,
-                    "url": search_url,
-                    "render_js": "true",
-                    "extract_rules": json.dumps({
-                        "products": {
-                            "selector": "[data-testid='product-card']",
-                            "type": "list",
-                            "output": {
-                                "name": "[data-testid='product-title']",
-                                "price": "[data-testid='product-price']",
-                                "original_price": "[data-testid='original-price']",
-                                "image": "img[data-testid='product-image']@src",
-                                "rating": "[data-testid='rating']",
-                                "sold_count": "[data-testid='sold-count']",
-                                "product_url": "a@href"
-                            }
-                        }
-                    })
-                }
-            )
-            if r.status_code != 200:
-                print(f"ScrapingBee search error: {r.status_code} - {r.text[:200]}")
-                return None
-            data = r.json()
-            products = data.get('products', [])
-            for p in products:
-                if p.get('product_url') and not p['product_url'].startswith('http'):
-                    p['product_url'] = 'https://www.temu.com' + p['product_url']
-            return products[:limit]
-    except Exception as e:
-        print(f"ScrapingBee search failed: {e}")
-        return None
-
-async def fetch_product_details(temu_url: str):
-    if not SCRAPINGBEE_KEY:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            r = await client.get(
-                SCRAPINGBEE_URL,
-                params={
-                    "api_key": SCRAPINGBEE_KEY,
-                    "url": temu_url,
-                    "render_js": "true",
-                    "extract_rules": json.dumps({
-                        "title": "h1",
-                        "price": "[data-testid='price']",
-                        "original_price": "[data-testid='original-price']",
-                        "discount": "[data-testid='discount']",
-                        "rating": "[data-testid='rating']",
-                        "sold_count": "[data-testid='sold-count']",
-                        "description": "[data-testid='description']",
-                        "images": {
-                            "selector": "img[data-testid='product-image']",
-                            "type": "list",
-                            "output": "@src"
-                        },
-                        "sizes": {
-                            "selector": "[data-testid='size-option']",
-                            "type": "list",
-                            "output": ".text"
-                        },
-                        "colors": {
-                            "selector": "[data-testid='color-option']",
-                            "type": "list",
-                            "output": "@title"
-                        }
-                    })
-                }
-            )
-            if r.status_code != 200:
-                return None
-            return r.json()
-    except Exception as e:
-        print(f"ScrapingBee details failed: {e}")
-        return None
-
-def get_cached_results(query: str):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT results FROM search_cache WHERE query = ?', (query.lower(),))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return json.loads(row[0])
-    return None
-
-def cache_results(query: str, results: list):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO search_cache (query, results) VALUES (?, ?)',
-              (query.lower(), json.dumps(results)))
-    conn.commit()
-    conn.close()
-
-def save_product(query: str, p: dict):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''INSERT INTO products
-        (query, name, price, original_price, discount, image, images, rating,
-         sold_count, product_url, description, sizes, colors, reviews)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-        (query, p.get('name'), p.get('price'), p.get('original_price'),
-         p.get('discount'), p.get('image'),
-         json.dumps(p.get('images')) if p.get('images') else None,
-         p.get('rating'), p.get('sold_count'), p.get('product_url'),
-         p.get('description'),
-         json.dumps(p.get('sizes')) if p.get('sizes') else None,
-         json.dumps(p.get('colors')) if p.get('colors') else None,
-         json.dumps(p.get('reviews')) if p.get('reviews') else None))
-    conn.commit()
-    conn.close()
 
 @app.get('/')
 async def root():
     return {
         'message': 'Temu Search API is running',
         'docs': '/docs',
-        'endpoints': ['/search', '/product-details', '/products', '/debug'],
-        'scraper': 'scrapingbee_only',
-        'version': '4.1'
+        'endpoints': ['/search', '/product-details', '/test-scrapingbee', '/debug'],
+        'version': '5.0'
     }
 
 @app.get('/debug')
 async def debug():
-    """نقطة فحص: تُظهر أسماء المتغيرات المتاحة (بدون قيم)"""
-    env_names = list(os.environ.keys())
     return {
-        'env_var_names': env_names,
         'has_scrapingbee': 'SCRAPINGBEE_API_KEY' in os.environ,
         'scrapingbee_length': len(SCRAPINGBEE_KEY),
-        'has_parse': 'PARSE_API_KEY' in os.environ,
     }
 
-@app.post('/search', response_model=SearchResponse)
+@app.get('/test-scrapingbee')
+async def test_scrapingbee():
+    """اختبار بسيط: هل ScrapingBee يعمل مع Temu؟"""
+    if not SCRAPINGBEE_KEY:
+        return {'error': 'No SCRAPINGBEE_API_KEY'}
+    
+    test_url = "https://www.temu.com/search_result.html?search_key=phone"
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Test 1: Simple request without extract_rules (just get HTML)
+            r1 = await client.get(
+                SCRAPINGBEE_URL,
+                params={
+                    "api_key": SCRAPINGBEE_KEY,
+                    "url": test_url,
+                    "render_js": "true",
+                    "wait": "5000",
+                }
+            )
+            
+            # Test 2: With AI extraction (more reliable than CSS selectors)
+            r2 = await client.get(
+                SCRAPINGBEE_URL,
+                params={
+                    "api_key": SCRAPINGBEE_KEY,
+                    "url": test_url,
+                    "render_js": "true",
+                    "wait": "5000",
+                    "ai_extract_rules": json.dumps({
+                        "products": "List all products with name, price, and image URL"
+                    })
+                }
+            )
+            
+            return {
+                'test1_simple_status': r1.status_code,
+                'test1_html_length': len(r1.text),
+                'test1_preview': r1.text[:500],
+                'test2_ai_status': r2.status_code,
+                'test2_ai_result': r2.json() if r2.status_code == 200 else r2.text[:500],
+            }
+    except Exception as e:
+        return {'error': str(e)}
+
+@app.post('/search')
 async def search(request: SearchRequest):
     query = request.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail='Query is required')
     
-    cached = get_cached_results(query)
-    if cached:
-        return SearchResponse(query=query, total_results=len(cached), products=cached, source='cache')
+    if not SCRAPINGBEE_KEY:
+        raise HTTPException(status_code=503, detail='SCRAPINGBEE_API_KEY not set')
     
-    items = await scrape_temu_search(query, request.max_results)
-    if not items:
-        raise HTTPException(status_code=503, detail='Search failed. Check SCRAPINGBEE_API_KEY.')
+    search_url = f"https://www.temu.com/search_result.html?search_key={query}"
     
-    products = []
-    for item in items:
-        products.append({
-            'name': item.get('name', 'Unknown'),
-            'price': item.get('price', '$0'),
-            'original_price': item.get('original_price'),
-            'discount': item.get('discount'),
-            'image': item.get('image', ''),
-            'images': None,
-            'rating': item.get('rating'),
-            'sold_count': item.get('sold_count'),
-            'product_url': item.get('product_url'),
-            'description': None,
-            'sizes': None,
-            'colors': None,
-            'reviews': None
-        })
-    
-    cache_results(query, products)
-    return SearchResponse(query=query, total_results=len(products), products=products, source='scrapingbee')
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Use AI extraction - more reliable for Temu
+            r = await client.get(
+                SCRAPINGBEE_URL,
+                params={
+                    "api_key": SCRAPINGBEE_KEY,
+                    "url": search_url,
+                    "render_js": "true",
+                    "wait": "5000",
+                    "ai_extract_rules": json.dumps({
+                        "products": f"List up to {request.max_results} products. For each: name, price, original_price if shown, discount if shown, image URL, rating if shown, sold count if shown, product URL"
+                    })
+                }
+            )
+            
+            if r.status_code != 200:
+                raise HTTPException(status_code=503, detail=f'ScrapingBee error: {r.status_code} - {r.text[:200]}')
+            
+            data = r.json()
+            products = data.get('products', [])
+            
+            if not products:
+                raise HTTPException(status_code=503, detail='No products found in response')
+            
+            return {
+                'query': query,
+                'total_results': len(products),
+                'products': products,
+                'source': 'scrapingbee_ai'
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f'Error: {str(e)}')
 
 @app.get('/product-details')
 async def product_details(url: str):
     if not url.startswith('https://www.temu.com'):
         raise HTTPException(status_code=400, detail='Invalid Temu URL')
     
-    details = await fetch_product_details(url)
-    if not details:
-        raise HTTPException(status_code=503, detail='Failed to fetch details. Check SCRAPINGBEE_API_KEY.')
+    if not SCRAPINGBEE_KEY:
+        raise HTTPException(status_code=503, detail='SCRAPINGBEE_API_KEY not set')
     
-    product = {
-        'name': details.get('title', 'Unknown'),
-        'price': details.get('price', '$0'),
-        'original_price': details.get('original_price'),
-        'discount': details.get('discount'),
-        'image': details.get('images', [''])[0] if details.get('images') else '',
-        'images': details.get('images'),
-        'rating': details.get('rating'),
-        'sold_count': details.get('sold_count'),
-        'product_url': url,
-        'description': details.get('description'),
-        'sizes': details.get('sizes'),
-        'colors': details.get('colors'),
-        'reviews': None,
-    }
-    save_product('', product)
-    return {'source': 'scrapingbee', 'product': product}
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.get(
+                SCRAPINGBEE_URL,
+                params={
+                    "api_key": SCRAPINGBEE_KEY,
+                    "url": url,
+                    "render_js": "true",
+                    "wait": "5000",
+                    "ai_extract_rules": json.dumps({
+                        "title": "Product title",
+                        "price": "Current price",
+                        "original_price": "Original price if shown",
+                        "discount": "Discount percentage if shown",
+                        "images": "All product image URLs",
+                        "description": "Full product description",
+                        "sizes": "Available sizes",
+                        "colors": "Available colors",
+                        "rating": "Product rating",
+                        "reviews": "Customer reviews if available"
+                    })
+                }
+            )
+            
+            if r.status_code != 200:
+                raise HTTPException(status_code=503, detail=f'ScrapingBee error: {r.status_code}')
+            
+            return {
+                'source': 'scrapingbee_ai',
+                'product': r.json()
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f'Error: {str(e)}')
 
 @app.get('/products')
 async def get_all_products():
