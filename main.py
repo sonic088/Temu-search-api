@@ -5,9 +5,7 @@ from typing import List, Optional
 import sqlite3
 import json
 import os
-import random
-import asyncio
-from playwright.async_api import async_playwright
+import httpx
 
 app = FastAPI(title='Temu Search API')
 
@@ -20,7 +18,7 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
-# Database Setup
+# Database
 DB_FILE = 'temu_products.db'
 
 def init_db():
@@ -34,9 +32,14 @@ def init_db():
         original_price TEXT,
         discount TEXT,
         image TEXT,
+        images TEXT,
         rating TEXT,
         sold_count TEXT,
         product_url TEXT,
+        description TEXT,
+        sizes TEXT,
+        colors TEXT,
+        reviews TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS search_cache (
@@ -60,9 +63,14 @@ class Product(BaseModel):
     original_price: Optional[str] = None
     discount: Optional[str] = None
     image: str
+    images: Optional[List[str]] = None
     rating: Optional[str] = None
     sold_count: Optional[str] = None
     product_url: Optional[str] = None
+    description: Optional[str] = None
+    sizes: Optional[List[str]] = None
+    colors: Optional[List[str]] = None
+    reviews: Optional[List[dict]] = None
 
 class SearchResponse(BaseModel):
     query: str
@@ -70,166 +78,93 @@ class SearchResponse(BaseModel):
     products: List[Product]
     source: str
 
-# Mock Data Generator (fallback)
-def generate_mock_products(query: str, count: int = 10) -> List[dict]:
-    categories = {
-        'shirt': ['Cotton T-Shirt', 'Polo Shirt', 'Dress Shirt', 'Flannel Shirt', 'Tank Top'],
-        'dress': ['Summer Dress', 'Evening Gown', 'Casual Dress', 'Maxi Dress', 'Mini Dress'],
-        'phone': ['Smartphone Case', 'Screen Protector', 'Charging Cable', 'Power Bank', 'Phone Stand'],
-        'shoes': ['Running Shoes', 'Casual Sneakers', 'Leather Boots', 'Sandals', 'Slippers'],
-        'bag': ['Backpack', 'Handbag', 'Crossbody Bag', 'Tote Bag', 'Wallet'],
+# ScrapingBee Config
+SCRAPINGBEE_KEY = os.getenv('SCRAPINGBEE_API_KEY', '')
+SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
+
+async def fetch_product_details(temu_url: str):
+    """جلب كل تفاصيل المنتج من Temu عبر ScrapingBee"""
+    if not SCRAPINGBEE_KEY:
+        return None
+    
+    # extract_rules: نستخرج البيانات مباشرة كـ JSON
+    extract_rules = {
+        "title": "h1",
+        "price": "[data-testid='price']",
+        "original_price": "[data-testid='original-price']",
+        "discount": "[data-testid='discount']",
+        "rating": "[data-testid='rating']",
+        "sold_count": "[data-testid='sold-count']",
+        "description": "[data-testid='description']",
+        "images": {
+            "selector": "img[data-testid='product-image']",
+            "type": "list",
+            "output": "@src"
+        },
+        "sizes": {
+            "selector": "[data-testid='size-option']",
+            "type": "list",
+            "output": ".text"
+        },
+        "colors": {
+            "selector": "[data-testid='color-option']",
+            "type": "list",
+            "output": "@title"
+        },
+        "reviews": {
+            "selector": "[data-testid='review-item']",
+            "type": "list",
+            "output": {
+                "user": ".reviewer-name",
+                "text": ".review-text",
+                "stars": ".review-stars"
+            }
+        }
     }
-    base_names = categories.get(query.lower(), ['Product', 'Item', 'Accessory', 'Gadget', 'Tool'])
-    products = []
-    for i in range(count):
-        base = random.choice(base_names)
-        price = round(random.uniform(5, 80), 2)
-        original = round(price * random.uniform(1.2, 2.5), 2)
-        discount = round(((original - price) / original) * 100)
-        products.append({
-            'name': f'{base} - Premium Quality {i+1}',
-            'price': f'${price:.2f}',
-            'original_price': f'${original:.2f}',
-            'discount': f'-{discount}%',
-            'image': f'https://picsum.photos/300/300?random={random.randint(1, 1000)}',
-            'rating': str(round(random.uniform(3.5, 5.0), 1)),
-            'sold_count': f'{random.randint(100, 9999)}+ sold',
-            'product_url': f'https://temu.com/product/{query}-{i+1}'
-        })
-    return products
-
-# Playwright Scraper
-async def scrape_with_playwright(query: str, max_results: int = 20):
-    products = []
+    
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                ]
-            )
-            context = await browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-                locale='en-US',
-            )
-            await context.add_init_script('''
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = { runtime: {} };
-            ''')
-            page = await context.new_page()
-            search_url = f'https://www.temu.com/search_result.html?search_key={query}'
-            await page.goto(search_url, wait_until='domcontentloaded', timeout=30000)
-            await asyncio.sleep(3)
-            products_data = await page.evaluate('''() => {
-                const scripts = document.querySelectorAll('script');
-                for (const script of scripts) {
-                    const text = script.textContent || '';
-                    if (text.includes('__INITIAL_STATE__')) {
-                        try {
-                            const match = text.match(/window\.__INITIAL_STATE__\s*=\s*({.*?});/);
-                            if (match) {
-                                const data = JSON.parse(match[1]);
-                                const goodsList = data.goodsList || (data.data && data.data.goodsList) || [];
-                                return goodsList.slice(0, 20).map(item => ({
-                                    name: item.goodsName || item.title || 'Unknown',
-                                    price: item.salePrice ? '$' + item.salePrice : '$0',
-                                    original_price: item.marketPrice ? '$' + item.marketPrice : null,
-                                    discount: item.discount ? '-' + item.discount + '%' : null,
-                                    image: item.thumbUrl || item.imageUrl || '',
-                                    rating: item.averageStar ? String(item.averageStar) : null,
-                                    sold_count: item.salesVolume ? item.salesVolume + '+ sold' : null,
-                                    product_url: item.linkUrl ? 'https://www.temu.com' + item.linkUrl : null
-                                }));
-                            }
-                        } catch(e) {}
-                    }
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.get(
+                SCRAPINGBEE_URL,
+                params={
+                    "api_key": SCRAPINGBEE_KEY,
+                    "url": temu_url,
+                    "render_js": "true",
+                    "extract_rules": json.dumps(extract_rules)
                 }
-                return [];
-            }''')
-            if products_data and len(products_data) > 0:
-                products = products_data[:max_results]
-            await browser.close()
+            )
+            if r.status_code != 200:
+                print(f"ScrapingBee error: {r.status_code} - {r.text[:200]}")
+                return None
+            return r.json()
     except Exception as e:
-        print(f'Playwright failed: {e}')
+        print(f"ScrapingBee failed: {e}")
         return None
-    return products if products else None
 
-# ScrapingAnt Scraper (Backup)
-async def scrape_with_scrapingant(query: str, max_results: int = 20):
-    import httpx
-    api_key = os.getenv('SCRAPINGANT_API_KEY', '')
-    if not api_key:
+# Parse API (للبحث عن المنتجات)
+PARSE_API_KEY = os.getenv('PARSE_API_KEY', '')
+PARSE_BASE_URL = 'https://api.parse.bot/scraper/19417d13-c955-4a31-bfb8-d40635cf048d'
+
+async def search_parse(query: str, limit: int = 20):
+    """البحث عن منتجات عبر Parse API"""
+    if not PARSE_API_KEY:
         return None
-    search_url = f'https://www.temu.com/search_result.html?search_key={query}'
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                'https://api.scrapingant.com/v2/general',
-                params={
-                    'url': search_url,
-                    'x-api-key': api_key,
-                    'proxy_country': 'US',
-                    'wait_for_selector': "[data-testid='goodsItem']",
-                    'browser': 'true'
-                }
+            r = await client.get(
+                f'{PARSE_BASE_URL}/search_products',
+                headers={'X-API-Key': PARSE_API_KEY},
+                params={'query': query, 'limit': limit, 'offset': 0, 'locale': 'en'}
             )
-            if response.status_code != 200:
+            if r.status_code != 200:
                 return None
-            html = response.text
-            products = parse_temu_html(html, query, max_results)
-            return products
+            data = r.json()
+            return data.get('data', {}).get('products', [])
     except Exception as e:
-        print(f'ScrapingAnt failed: {e}')
+        print(f"Parse search failed: {e}")
         return None
 
-def parse_temu_html(html: str, query: str, max_results: int) -> List[dict]:
-    import re
-    products = []
-    json_matches = re.findall(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', html, re.DOTALL)
-    if json_matches:
-        try:
-            data = json.loads(json_matches[0])
-            goods_list = data.get('goodsList', []) or data.get('data', {}).get('goodsList', [])
-            for item in goods_list[:max_results]:
-                products.append({
-                    'name': item.get('goodsName', 'Unknown Product'),
-                    'price': f"${item.get('salePrice', '0')}",
-                    'original_price': f"${item.get('marketPrice', '')}" if item.get('marketPrice') else None,
-                    'discount': f"-{item.get('discount', '')}%" if item.get('discount') else None,
-                    'image': item.get('thumbUrl', '') or item.get('imageUrl', ''),
-                    'rating': str(item.get('averageStar', '')) if item.get('averageStar') else None,
-                    'sold_count': f"{item.get('salesVolume', '')}+ sold" if item.get('salesVolume') else None,
-                    'product_url': f"https://www.temu.com{item.get('linkUrl', '')}" if item.get('linkUrl') else None
-                })
-        except Exception as e:
-            print(f'JSON parse error: {e}')
-    if not products:
-        product_blocks = re.findall(r'<div[^>]*data-testid="goodsItem"[^>]*>(.*?)</div>\s*</div>\s*</div>', html, re.DOTALL)
-        for block in product_blocks[:max_results]:
-            try:
-                name = re.search(r'class="goods-name"[^>]*>(.*?)</span>', block)
-                price = re.search(r'class="goods-price"[^>]*>(.*?)</span>', block)
-                img = re.search(r'<img[^>]*src="([^"]+)"', block)
-                products.append({
-                    'name': name.group(1).strip() if name else f'{query} Product',
-                    'price': price.group(1).strip() if price else '$9.99',
-                    'original_price': None,
-                    'discount': None,
-                    'image': img.group(1) if img else '',
-                    'rating': None,
-                    'sold_count': None,
-                    'product_url': None
-                })
-            except:
-                continue
-    return products
-
-# Database Functions
+# Database helpers
 def get_cached_results(query: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -248,16 +183,21 @@ def cache_results(query: str, results: list):
     conn.commit()
     conn.close()
 
-def save_products(query: str, products: list):
+def save_product(query: str, p: dict):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    for p in products:
-        c.execute('''INSERT INTO products
-            (query, name, price, original_price, discount, image, rating, sold_count, product_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (query, p.get('name'), p.get('price'), p.get('original_price'),
-             p.get('discount'), p.get('image'), p.get('rating'),
-             p.get('sold_count'), p.get('product_url')))
+    c.execute('''INSERT INTO products
+        (query, name, price, original_price, discount, image, images, rating,
+         sold_count, product_url, description, sizes, colors, reviews)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        (query, p.get('name'), p.get('price'), p.get('original_price'),
+         p.get('discount'), p.get('image'),
+         json.dumps(p.get('images')) if p.get('images') else None,
+         p.get('rating'), p.get('sold_count'), p.get('product_url'),
+         p.get('description'),
+         json.dumps(p.get('sizes')) if p.get('sizes') else None,
+         json.dumps(p.get('colors')) if p.get('colors') else None,
+         json.dumps(p.get('reviews')) if p.get('reviews') else None))
     conn.commit()
     conn.close()
 
@@ -270,14 +210,14 @@ def get_all_products_db():
     conn.close()
     return [dict(row) for row in rows]
 
-def get_products_by_query(query: str):
+def get_product_by_url(url: str):
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute('SELECT * FROM products WHERE query = ? ORDER BY created_at DESC LIMIT 20', (query.lower(),))
-    rows = c.fetchall()
+    c.execute('SELECT * FROM products WHERE product_url = ?', (url,))
+    row = c.fetchone()
     conn.close()
-    return [dict(row) for row in rows]
+    return dict(row) if row else None
 
 # API Endpoints
 @app.get('/')
@@ -285,9 +225,9 @@ async def root():
     return {
         'message': 'Temu Search API is running',
         'docs': '/docs',
-        'endpoints': ['/search', '/products', '/recommendations/{query}'],
-        'scraper': 'playwright',
-        'version': '2.0'
+        'endpoints': ['/search', '/product-details', '/products'],
+        'scraper': 'parse_api + scrapingbee',
+        'version': '3.0'
     }
 
 @app.post('/search', response_model=SearchResponse)
@@ -295,53 +235,100 @@ async def search(request: SearchRequest):
     query = request.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail='Query is required')
+    
+    # 1. Cache
     cached = get_cached_results(query)
     if cached:
-        return SearchResponse(
-            query=query,
-            total_results=len(cached),
-            products=cached,
-            source='cache'
-        )
-    products = await scrape_with_playwright(query, request.max_results)
-    source = 'playwright'
-    if not products:
-        products = await scrape_with_scrapingant(query, request.max_results)
-        source = 'scrapingant'
-    if not products:
-        products = generate_mock_products(query, request.max_results)
-        source = 'mock'
-    if products:
-        save_products(query, products)
-        cache_results(query, products)
-    return SearchResponse(
-        query=query,
-        total_results=len(products),
-        products=products,
-        source=source
-    )
+        return SearchResponse(query=query, total_results=len(cached), products=cached, source='cache')
+    
+    # 2. Parse API للبحث
+    items = await search_parse(query, request.max_results)
+    if not items:
+        raise HTTPException(status_code=503, detail='Search failed. Check PARSE_API_KEY.')
+    
+    # 3. تحويل Parse → Product model
+    products = []
+    for item in items:
+        products.append({
+            'name': item.get('title', 'Unknown'),
+            'price': item.get('price', '$0'),
+            'original_price': item.get('market_price'),
+            'discount': f"-{item.get('discount_percent')}%" if item.get('discount_percent') else None,
+            'image': item.get('thumbnail', ''),
+            'images': None,
+            'rating': str(item.get('rating')) if item.get('rating') is not None else None,
+            'sold_count': item.get('sold_count'),
+            'product_url': item.get('product_url'),
+            'description': None,
+            'sizes': None,
+            'colors': None,
+            'reviews': None
+        })
+    
+    cache_results(query, products)
+    return SearchResponse(query=query, total_results=len(products), products=products, source='parse_api')
+
+@app.get('/product-details')
+async def product_details(url: str):
+    """جلب تفاصيل كاملة لمنتج واحد عبر ScrapingBee"""
+    if not url.startswith('https://www.temu.com'):
+        raise HTTPException(status_code=400, detail='Invalid Temu URL')
+    
+    # Check DB first
+    db_product = get_product_by_url(url)
+    if db_product and db_product.get('description'):
+        # Already has full details
+        return {
+            'source': 'database',
+            'product': {
+                'name': db_product['name'],
+                'price': db_product['price'],
+                'original_price': db_product['original_price'],
+                'discount': db_product['discount'],
+                'image': db_product['image'],
+                'images': json.loads(db_product['images']) if db_product['images'] else None,
+                'rating': db_product['rating'],
+                'sold_count': db_product['sold_count'],
+                'product_url': db_product['product_url'],
+                'description': db_product['description'],
+                'sizes': json.loads(db_product['sizes']) if db_product['sizes'] else None,
+                'colors': json.loads(db_product['colors']) if db_product['colors'] else None,
+                'reviews': json.loads(db_product['reviews']) if db_product['reviews'] else None,
+            }
+        }
+    
+    # Fetch from ScrapingBee
+    details = await fetch_product_details(url)
+    if not details:
+        raise HTTPException(status_code=503, detail='Failed to fetch product details. Check SCRAPINGBEE_API_KEY.')
+    
+    product = {
+        'name': details.get('title', 'Unknown'),
+        'price': details.get('price', '$0'),
+        'original_price': details.get('original_price'),
+        'discount': details.get('discount'),
+        'image': details.get('images', [''])[0] if details.get('images') else '',
+        'images': details.get('images'),
+        'rating': details.get('rating'),
+        'sold_count': details.get('sold_count'),
+        'product_url': url,
+        'description': details.get('description'),
+        'sizes': details.get('sizes'),
+        'colors': details.get('colors'),
+        'reviews': details.get('reviews'),
+    }
+    
+    # Save to DB
+    save_product('', product)
+    
+    return {
+        'source': 'scrapingbee',
+        'product': product
+    }
 
 @app.get('/products')
 async def get_all_products():
     return get_all_products_db()
-
-@app.get('/recommendations/{query}')
-async def recommendations(query: str):
-    products = get_products_by_query(query)
-    if not products:
-        products = generate_mock_products(query, 10)
-    try:
-        recommended = sorted(
-            products,
-            key=lambda x: float(x.get('price', '0').replace('$', '').replace(',', ''))
-        )[:3]
-    except:
-        recommended = products[:3]
-    return {
-        'query': query,
-        'recommendations': recommended,
-        'total_analyzed': len(products)
-    }
 
 if __name__ == '__main__':
     import uvicorn
