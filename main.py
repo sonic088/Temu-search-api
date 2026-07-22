@@ -6,6 +6,7 @@ import sqlite3
 import json
 import os
 import httpx
+import re
 
 app = FastAPI(title='Temu Search API')
 
@@ -51,61 +52,9 @@ async def root():
     return {
         'message': 'Temu Search API is running',
         'docs': '/docs',
-        'endpoints': ['/search', '/product-details', '/test-scrapingbee', '/debug'],
-        'version': '5.0'
+        'endpoints': ['/search', '/product-details', '/products'],
+        'version': '6.0'
     }
-
-@app.get('/debug')
-async def debug():
-    return {
-        'has_scrapingbee': 'SCRAPINGBEE_API_KEY' in os.environ,
-        'scrapingbee_length': len(SCRAPINGBEE_KEY),
-    }
-
-@app.get('/test-scrapingbee')
-async def test_scrapingbee():
-    """اختبار بسيط: هل ScrapingBee يعمل مع Temu؟"""
-    if not SCRAPINGBEE_KEY:
-        return {'error': 'No SCRAPINGBEE_API_KEY'}
-    
-    test_url = "https://www.temu.com/search_result.html?search_key=phone"
-    
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # Test 1: Simple request without extract_rules (just get HTML)
-            r1 = await client.get(
-                SCRAPINGBEE_URL,
-                params={
-                    "api_key": SCRAPINGBEE_KEY,
-                    "url": test_url,
-                    "render_js": "true",
-                    "wait": "5000",
-                }
-            )
-            
-            # Test 2: With AI extraction (more reliable than CSS selectors)
-            r2 = await client.get(
-                SCRAPINGBEE_URL,
-                params={
-                    "api_key": SCRAPINGBEE_KEY,
-                    "url": test_url,
-                    "render_js": "true",
-                    "wait": "5000",
-                    "ai_extract_rules": json.dumps({
-                        "products": "List all products with name, price, and image URL"
-                    })
-                }
-            )
-            
-            return {
-                'test1_simple_status': r1.status_code,
-                'test1_html_length': len(r1.text),
-                'test1_preview': r1.text[:500],
-                'test2_ai_status': r2.status_code,
-                'test2_ai_result': r2.json() if r2.status_code == 200 else r2.text[:500],
-            }
-    except Exception as e:
-        return {'error': str(e)}
 
 @app.post('/search')
 async def search(request: SearchRequest):
@@ -120,34 +69,70 @@ async def search(request: SearchRequest):
     
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            # Use AI extraction - more reliable for Temu
+            # PREMIUM PROXY + JS RENDERING — يتجاوز Cloudflare
             r = await client.get(
                 SCRAPINGBEE_URL,
                 params={
                     "api_key": SCRAPINGBEE_KEY,
                     "url": search_url,
                     "render_js": "true",
-                    "wait": "5000",
-                    "ai_extract_rules": json.dumps({
-                        "products": f"List up to {request.max_results} products. For each: name, price, original_price if shown, discount if shown, image URL, rating if shown, sold count if shown, product URL"
-                    })
+                    "premium_proxy": "true",  # ← الحل السحري
+                    "wait": "8000",
+                    "block_resources": "false",
                 }
             )
             
             if r.status_code != 200:
-                raise HTTPException(status_code=503, detail=f'ScrapingBee error: {r.status_code} - {r.text[:200]}')
+                raise HTTPException(status_code=503, detail=f'ScrapingBee error: {r.status_code}')
             
-            data = r.json()
-            products = data.get('products', [])
+            html = r.text
+            
+            # استخراج المنتجات من HTML مباشرة (regex)
+            products = []
+            
+            # Temu يستخدم JSON مضمن في الصفحة
+            json_matches = re.findall(r'window\._SSR_HYDRATED_DATA\s*=\s*({.+?});', html)
+            if json_matches:
+                try:
+                    data = json.loads(json_matches[0])
+                    items = data.get('searchResult', {}).get('data', [])
+                    for item in items[:request.max_results]:
+                        products.append({
+                            'name': item.get('title', 'Unknown'),
+                            'price': item.get('price', '$0'),
+                            'original_price': item.get('market_price'),
+                            'discount': f"-{item.get('discount')}" if item.get('discount') else None,
+                            'image': item.get('thumb_url', ''),
+                            'rating': str(item.get('rating')) if item.get('rating') else None,
+                            'sold_count': item.get('sold_count'),
+                            'product_url': f"https://www.temu.com{item.get('url', '')}" if item.get('url') else ''
+                        })
+                except:
+                    pass
+            
+            # Fallback: regex على HTML
+            if not products:
+                titles = re.findall(r'"title":"([^"]+)"', html)
+                prices = re.findall(r'"price":"([^"]+)"', html)
+                images = re.findall(r'"thumb_url":"([^"]+)"', html)
+                urls = re.findall(r'"url":"(/[^"]+)"', html)
+                
+                for i in range(min(len(titles), request.max_results)):
+                    products.append({
+                        'name': titles[i] if i < len(titles) else 'Unknown',
+                        'price': prices[i] if i < len(prices) else '$0',
+                        'image': images[i] if i < len(images) else '',
+                        'product_url': f"https://www.temu.com{urls[i]}" if i < len(urls) else '',
+                    })
             
             if not products:
-                raise HTTPException(status_code=503, detail='No products found in response')
+                raise HTTPException(status_code=503, detail='No products found. Temu may be blocking.')
             
             return {
                 'query': query,
                 'total_results': len(products),
                 'products': products,
-                'source': 'scrapingbee_ai'
+                'source': 'scrapingbee_premium'
             }
             
     except HTTPException:
@@ -171,28 +156,52 @@ async def product_details(url: str):
                     "api_key": SCRAPINGBEE_KEY,
                     "url": url,
                     "render_js": "true",
-                    "wait": "5000",
-                    "ai_extract_rules": json.dumps({
-                        "title": "Product title",
-                        "price": "Current price",
-                        "original_price": "Original price if shown",
-                        "discount": "Discount percentage if shown",
-                        "images": "All product image URLs",
-                        "description": "Full product description",
-                        "sizes": "Available sizes",
-                        "colors": "Available colors",
-                        "rating": "Product rating",
-                        "reviews": "Customer reviews if available"
-                    })
+                    "premium_proxy": "true",  # ← الحل السحري
+                    "wait": "8000",
                 }
             )
             
             if r.status_code != 200:
                 raise HTTPException(status_code=503, detail=f'ScrapingBee error: {r.status_code}')
             
+            html = r.text
+            
+            # استخراج من JSON مضمن
+            product = {
+                'name': 'Unknown',
+                'price': '$0',
+                'image': '',
+                'images': [],
+                'description': '',
+                'sizes': [],
+                'colors': [],
+            }
+            
+            json_matches = re.findall(r'window\._SSR_HYDRATED_DATA\s*=\s*({.+?});', html)
+            if json_matches:
+                try:
+                    data = json.loads(json_matches[0])
+                    p = data.get('goods', {})
+                    product = {
+                        'name': p.get('title', 'Unknown'),
+                        'price': p.get('price', '$0'),
+                        'original_price': p.get('market_price'),
+                        'discount': p.get('discount'),
+                        'image': p.get('thumb_url', ''),
+                        'images': p.get('thumb_url_list', []),
+                        'description': p.get('description', ''),
+                        'sizes': [s.get('name') for s in p.get('specs', []) if s.get('name')],
+                        'colors': [c.get('name') for c in p.get('specs', []) if c.get('name')],
+                        'rating': str(p.get('rating')) if p.get('rating') else None,
+                        'sold_count': p.get('sold_count'),
+                        'product_url': url,
+                    }
+                except:
+                    pass
+            
             return {
-                'source': 'scrapingbee_ai',
-                'product': r.json()
+                'source': 'scrapingbee_premium',
+                'product': product
             }
     except HTTPException:
         raise
