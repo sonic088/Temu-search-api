@@ -15,13 +15,7 @@ app = Flask(__name__)
 
 OXYLABS_USER = os.environ.get('OXYLABS_USER', '')
 OXYLABS_PASS = os.environ.get('OXYLABS_PASS', '')
-
-# Try multiple Oxylabs endpoints
-OXYLABS_ENDPOINTS = [
-    "https://realtime.oxylabs.io/v1/queries",
-    "https://scraper-api.oxylabs.io/v2/queries",
-    "https://realtime.oxylabs.io/v1/scrape",
-]
+OXYLABS_API_URL = "https://realtime.oxylabs.io/v1/queries"
 
 DB_PATH = os.environ.get('DB_PATH', '/tmp/temu_cache.db')
 CACHE_DAYS = int(os.environ.get('CACHE_DAYS', 7))
@@ -103,59 +97,127 @@ def save_product_cache(url, data):
     conn.close()
 
 def fetch_oxylabs(target_url, timeout=60):
-    """Fetch URL through Oxylabs with multiple endpoints and sources."""
+    """Try Oxylabs API first."""
+    if not OXYLABS_USER or not OXYLABS_PASS:
+        return None, "Oxylabs credentials not configured"
 
-    # Build Basic Auth header manually to handle special chars like +
-    credentials = f"{OXYLABS_USER}:{OXYLABS_PASS}"
-    encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
-    headers = {
-        "Authorization": f"Basic {encoded_credentials}",
-        "Content-Type": "application/json"
+    payload = {
+        "url": target_url,
+        "source": "universal",
+        "render": "html",
+        "geo_location": "United States",
     }
 
-    sources_to_try = [
-        {"source": "universal", "render": "html", "geo_location": "United States"},
-        {"source": "universal", "render": "html"},
-        {"source": "google", "render": "html"},
-        {"source": "amazon", "render": "html"},
+    try:
+        resp = requests.post(
+            OXYLABS_API_URL,
+            auth=(OXYLABS_USER, OXYLABS_PASS),
+            json=payload,
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("results", [])
+            if results and len(results) > 0:
+                content = results[0].get("content", "")
+                if content:
+                    return content, None
+            if "content" in data:
+                return data["content"], None
+            return None, "Oxylabs returned empty content"
+        else:
+            try:
+                err = resp.json()
+                return None, f"HTTP {resp.status_code}: {json.dumps(err)[:300]}"
+            except:
+                return None, f"HTTP {resp.status_code}: {resp.text[:300]}"
+    except Exception as e:
+        return None, str(e)[:300]
+
+def fetch_direct(target_url, timeout=30):
+    """Try direct fetch without proxy."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    try:
+        resp = requests.get(target_url, headers=headers, timeout=timeout, allow_redirects=True)
+        resp.raise_for_status()
+        return resp.text, None
+    except Exception as e:
+        return None, str(e)[:300]
+
+def get_mock_search_results(query):
+    """Return mock data for testing when all fetch methods fail."""
+    return [
+        {
+            "product_id": "601099518075471",
+            "title": f"Mock Product 1 for {query}",
+            "price": "$5.99",
+            "original_price": "$15.99",
+            "rating": 4.7,
+            "sold_count": "5K+ sold",
+            "discount_percent": 62,
+            "image": "https://img.kwcdn.com/product/open/2023-09-08/1694161234567-1234567890.jpg",
+            "product_url": "https://www.temu.com/goods.html?goods_id=601099518075471"
+        },
+        {
+            "product_id": "601099518075472",
+            "title": f"Mock Product 2 for {query}",
+            "price": "$3.49",
+            "original_price": "$12.99",
+            "rating": 4.5,
+            "sold_count": "10K+ sold",
+            "discount_percent": 73,
+            "image": "https://img.kwcdn.com/product/open/2023-09-08/1694161234568-1234567891.jpg",
+            "product_url": "https://www.temu.com/goods.html?goods_id=601099518075472"
+        },
+        {
+            "product_id": "601099518075473",
+            "title": f"Mock Product 3 for {query}",
+            "price": "$8.99",
+            "original_price": "$25.99",
+            "rating": 4.8,
+            "sold_count": "2K+ sold",
+            "discount_percent": 65,
+            "image": "https://img.kwcdn.com/product/open/2023-09-08/1694161234569-1234567892.jpg",
+            "product_url": "https://www.temu.com/goods.html?goods_id=601099518075473"
+        }
     ]
 
-    all_errors = []
-
-    for endpoint in OXYLABS_ENDPOINTS:
-        for src_config in sources_to_try:
-            payload = {"url": target_url}
-            payload.update(src_config)
-
-            try:
-                resp = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
-                status = resp.status_code
-
-                if status == 200:
-                    data = resp.json()
-                    results = data.get("results", [])
-                    if results and len(results) > 0:
-                        content = results[0].get("content", "")
-                        if content:
-                            return content
-                    if "content" in data:
-                        return data["content"]
-                    return None
-                else:
-                    try:
-                        err = resp.json()
-                        err_msg = f"{endpoint} | {src_config['source']} | HTTP {status}: {json.dumps(err)[:200]}"
-                    except:
-                        err_msg = f"{endpoint} | {src_config['source']} | HTTP {status}: {resp.text[:200]}"
-                    all_errors.append(err_msg)
-                    print(f"[Oxylabs] {err_msg}")
-
-            except requests.exceptions.Timeout:
-                all_errors.append(f"{endpoint} | {src_config['source']} | Timeout")
-            except Exception as e:
-                all_errors.append(f"{endpoint} | {src_config['source']} | {str(e)[:200]}")
-
-    return None, " | ".join(all_errors[:3])
+def get_mock_product_detail(product_url):
+    """Return mock product details for testing."""
+    return {
+        "product_url": product_url,
+        "title": "Mock Wireless Earbuds Bluetooth 5.3",
+        "price": "$4.73",
+        "original_price": "$20.20",
+        "currency": "USD",
+        "rating": 4.8,
+        "review_count": 1677,
+        "sold_count": "10K+ sold",
+        "description": "High quality wireless earbuds with noise cancellation and long battery life.",
+        "images": [
+            "https://img.kwcdn.com/product/open/2023-09-08/1694161234567-1234567890.jpg",
+            "https://img.kwcdn.com/product/open/2023-09-08/1694161234568-1234567891.jpg",
+            "https://img.kwcdn.com/product/open/2023-09-08/1694161234569-1234567892.jpg"
+        ],
+        "colors": ["Black", "White", "Blue", "Pink"],
+        "sizes": ["One Size"],
+        "specs": {
+            "Material": "Plastic",
+            "Weight": "50g",
+            "Battery": "30 hours",
+            "Bluetooth": "5.3"
+        },
+        "store_info": {"name": "Mock Store"},
+        "variants": [
+            {"sku_id": "123", "color": "Black", "size": "One Size", "price": "$4.73", "available": True},
+            {"sku_id": "124", "color": "White", "size": "One Size", "price": "$4.73", "available": True},
+            {"sku_id": "125", "color": "Blue", "size": "One Size", "price": "$4.99", "available": True}
+        ]
+    }
 
 def parse_search_results(html):
     soup = BeautifulSoup(html, 'lxml')
@@ -338,7 +400,7 @@ def parse_product_detail(html, product_url):
 def home():
     return jsonify({
         "service": "Temu Scraper API with Cache",
-        "powered_by": "Oxylabs Web Scraper API",
+        "powered_by": "Oxylabs Web Scraper API + Fallback",
         "database": "SQLite (cached for " + str(CACHE_DAYS) + " days)",
         "endpoints": {
             "GET /search?q=<keyword>&limit=<n>": "Search products (cached)",
@@ -353,31 +415,55 @@ def home():
 def search_products():
     query = request.args.get('q', '').strip()
     limit = min(int(request.args.get('limit', 12)), 24)
+    use_mock = request.args.get('mock', 'false').lower() == 'true'
+
     if not query:
         return jsonify({"error": "Missing 'q' parameter"}), 400
 
+    # 1. Check cache
     cached = get_cached_search(query)
     if cached:
         products = cached[:limit]
         return jsonify({"success": True, "source": "cache", "query": query, "count": len(products), "products": products})
 
+    # 2. Try Oxylabs
     search_url = f"https://www.temu.com/search_result.html?search_key={quote(query)}"
-    result = fetch_oxylabs(search_url, timeout=60)
+    html, oxylabs_error = fetch_oxylabs(search_url, timeout=60)
 
-    if isinstance(result, tuple):
-        html, error_msg = result
-        if html is None:
-            return jsonify({"error": f"Oxylabs failed", "details": error_msg}), 502
-    else:
-        html = result
+    if html:
+        products = parse_search_results(html)[:limit]
+        if products:
+            save_search_cache(query, products)
+            return jsonify({"success": True, "source": "oxylabs", "query": query, "count": len(products), "products": products})
 
-    if not html:
-        return jsonify({"error": "Oxylabs returned empty content"}), 502
+    # 3. Try direct scraping
+    html, direct_error = fetch_direct(search_url, timeout=30)
 
-    products = parse_search_results(html)[:limit]
-    if products:
-        save_search_cache(query, products)
-    return jsonify({"success": True, "source": "oxylabs", "query": query, "count": len(products), "products": products})
+    if html:
+        products = parse_search_results(html)[:limit]
+        if products:
+            save_search_cache(query, products)
+            return jsonify({"success": True, "source": "direct", "query": query, "count": len(products), "products": products})
+
+    # 4. Fallback to mock data
+    if use_mock:
+        products = get_mock_search_results(query)[:limit]
+        return jsonify({
+            "success": True,
+            "source": "mock",
+            "query": query,
+            "count": len(products),
+            "products": products,
+            "oxylabs_error": oxylabs_error,
+            "direct_error": direct_error
+        })
+
+    return jsonify({
+        "error": "All fetch methods failed",
+        "oxylabs_error": oxylabs_error,
+        "direct_error": direct_error,
+        "note": "Add ?mock=true to get test data"
+    }), 502
 
 @app.route('/product', methods=['GET', 'POST'])
 def product_detail():
@@ -386,6 +472,8 @@ def product_detail():
         product_url = body.get('url', '').strip()
     else:
         product_url = request.args.get('url', '').strip()
+    use_mock = request.args.get('mock', 'false').lower() == 'true'
+
     if not product_url:
         return jsonify({"error": "Missing 'url' parameter"}), 400
     if not product_url.startswith('http'):
@@ -393,24 +481,44 @@ def product_detail():
     if 'temu.com' not in product_url:
         return jsonify({"error": "Invalid Temu URL"}), 400
 
+    # 1. Check cache
     cached = get_cached_product(product_url)
     if cached:
         return jsonify({"success": True, "source": "cache", "product": cached})
 
-    result = fetch_oxylabs(product_url, timeout=90)
-    if isinstance(result, tuple):
-        html, error_msg = result
-        if html is None:
-            return jsonify({"error": f"Oxylabs failed", "details": error_msg}), 502
-    else:
-        html = result
+    # 2. Try Oxylabs
+    html, oxylabs_error = fetch_oxylabs(product_url, timeout=90)
 
-    if not html:
-        return jsonify({"error": "Oxylabs returned empty content"}), 502
+    if html:
+        data = parse_product_detail(html, product_url)
+        save_product_cache(product_url, data)
+        return jsonify({"success": True, "source": "oxylabs", "product": data})
 
-    data = parse_product_detail(html, product_url)
-    save_product_cache(product_url, data)
-    return jsonify({"success": True, "source": "oxylabs", "product": data})
+    # 3. Try direct scraping
+    html, direct_error = fetch_direct(product_url, timeout=30)
+
+    if html:
+        data = parse_product_detail(html, product_url)
+        save_product_cache(product_url, data)
+        return jsonify({"success": True, "source": "direct", "product": data})
+
+    # 4. Fallback to mock data
+    if use_mock:
+        data = get_mock_product_detail(product_url)
+        return jsonify({
+            "success": True,
+            "source": "mock",
+            "product": data,
+            "oxylabs_error": oxylabs_error,
+            "direct_error": direct_error
+        })
+
+    return jsonify({
+        "error": "All fetch methods failed",
+        "oxylabs_error": oxylabs_error,
+        "direct_error": direct_error,
+        "note": "Add ?mock=true to get test data"
+    }), 502
 
 @app.route('/stats')
 def stats():
