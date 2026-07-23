@@ -3,70 +3,144 @@ import requests
 import os
 import re
 import json
+import sqlite3
+import hashlib
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
-from urllib.parse import urlencode, quote
+from urllib.parse import quote
+from threading import Lock
 
 app = Flask(__name__)
 
-# ─── Oxylabs Configuration ─────────────────────────────────────────
-# Use Web Unblocker for best results with Temu
+# Oxylabs Web Scraper API credentials
 OXYLABS_USER = os.environ.get('OXYLABS_USER', '')
 OXYLABS_PASS = os.environ.get('OXYLABS_PASS', '')
+OXYLABS_API_URL = "https://realtime.oxylabs.io/v1/queries"
 
-# Web Unblocker endpoint (best for anti-bot sites like Temu)
-OXYLABS_PROXY = f"http://{OXYLABS_USER}:{OXYLABS_PASS}@unblock.oxylabs.io:60000"
+DB_PATH = os.environ.get('DB_PATH', '/tmp/temu_cache.db')
+CACHE_DAYS = int(os.environ.get('CACHE_DAYS', 7))
 
-# Alternative: Web Scraper API (structured data)
-OXYLABS_SCRAPER_API = "https://realtime.oxylabs.io/v1/queries"
+db_lock = Lock()
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
-    "Connection": "keep-alive",
-}
+def init_db():
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS search_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_hash TEXT UNIQUE,
+                query TEXT,
+                results TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS product_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url_hash TEXT UNIQUE,
+                url TEXT,
+                product_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        conn.close()
 
-# ─── Helper: Fetch via Oxylabs Web Unblocker ───────────────────────
-def fetch_oxylabs(url, render_js=True, timeout=45):
-    """Fetch URL through Oxylabs Web Unblocker with JS rendering."""
-    proxies = {
-        "http": OXYLABS_PROXY,
-        "https": OXYLABS_PROXY,
-    }
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    # Add render instruction for Oxylabs
-    target_url = url
-    if render_js:
-        # Oxylabs Web Unblocker handles JS automatically
-        pass
+def hash_text(text):
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
 
+def is_fresh(created_at_str):
     try:
-        resp = requests.get(
-            target_url,
-            proxies=proxies,
-            headers=HEADERS,
+        created = datetime.strptime(created_at_str, '%Y-%m-%d %H:%M:%S')
+        return datetime.now() - created < timedelta(days=CACHE_DAYS)
+    except:
+        return False
+
+def get_cached_search(query):
+    query_hash = hash_text(query.lower().strip())
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM search_cache WHERE query_hash = ?", (query_hash,)
+    ).fetchone()
+    conn.close()
+    if row and is_fresh(row['created_at']):
+        return json.loads(row['results'])
+    return None
+
+def save_search_cache(query, results):
+    query_hash = hash_text(query.lower().strip())
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO search_cache (query_hash, query, results)
+        VALUES (?, ?, ?)
+        ON CONFLICT(query_hash) DO UPDATE SET
+            results=excluded.results,
+            created_at=CURRENT_TIMESTAMP
+    """, (query_hash, query, json.dumps(results)))
+    conn.commit()
+    conn.close()
+
+def get_cached_product(url):
+    url_hash = hash_text(url)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM product_cache WHERE url_hash = ?", (url_hash,)
+    ).fetchone()
+    conn.close()
+    if row and is_fresh(row['created_at']):
+        return json.loads(row['product_data'])
+    return None
+
+def save_product_cache(url, data):
+    url_hash = hash_text(url)
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO product_cache (url_hash, url, product_data)
+        VALUES (?, ?, ?)
+        ON CONFLICT(url_hash) DO UPDATE SET
+            product_data=excluded.product_data,
+            created_at=CURRENT_TIMESTAMP
+    """, (url_hash, url, json.dumps(data)))
+    conn.commit()
+    conn.close()
+
+def fetch_oxylabs(target_url, timeout=60):
+    payload = {
+        "url": target_url,
+        "source": "universal",
+        "render": "html",
+        "geo_location": "United States",
+    }
+    try:
+        resp = requests.post(
+            OXYLABS_API_URL,
+            auth=(OXYLABS_USER, OXYLABS_PASS),
+            json=payload,
             timeout=timeout,
-            allow_redirects=True
         )
         resp.raise_for_status()
-        return resp.text
+        data = resp.json()
+        results = data.get("results", [])
+        if results and len(results) > 0:
+            content = results[0].get("content", "")
+            if content:
+                return content
+        if "content" in data:
+            return data["content"]
+        return None
     except Exception as e:
         print(f"[Oxylabs Error] {e}")
         return None
 
-
-# ─── Helper: Parse Product List (Search Results) ───────────────────
 def parse_search_results(html):
-    """Extract product cards from Temu search results page."""
     soup = BeautifulSoup(html, 'lxml')
     products = []
-
-    # Temu uses dynamic class names, so we use structural selectors
-    # These may need updating as Temu changes their frontend
-
-    # Try multiple selector strategies
     cards = (
         soup.select('div[data-testid="product-card"]') or
         soup.select('div[class*="goods-item"]') or
@@ -74,143 +148,77 @@ def parse_search_results(html):
         soup.select('a[href*="goods.html"]') or
         soup.find_all('div', class_=re.compile(r'.*goods.*'))
     )
-
-    for card in cards[:24]:  # Limit to 24 results
+    for card in cards[:24]:
         product = {}
-
-        # Product ID from URL
         link_tag = card if card.name == 'a' else card.find('a', href=re.compile(r'goods_id'))
         if link_tag and link_tag.get('href'):
             href = link_tag['href']
             if href.startswith('/'):
                 href = 'https://www.temu.com' + href
             product['product_url'] = href
-            # Extract goods_id
             match = re.search(r'goods_id[=:](\d+)', href)
             if match:
                 product['product_id'] = match.group(1)
-
-        # Title
-        title_tag = (
-            card.select_one('[class*="title"]') or
-            card.select_one('h2') or
-            card.select_one('h3') or
-            card.select_one('span[class*="title"]')
-        )
+        title_tag = (card.select_one('[class*="title"]') or card.select_one('h2') or 
+                     card.select_one('h3') or card.select_one('span[class*="title"]'))
         if title_tag:
             product['title'] = title_tag.get_text(strip=True)
-
-        # Price
-        price_tag = (
-            card.select_one('[class*="price"]') or
-            card.select_one('span[class*="_2de9"]') or
-            card.find(text=re.compile(r'\$\d+'))
-        )
+        price_tag = (card.select_one('[class*="price"]') or card.select_one('span[class*="_2de9"]') or
+                     card.find(text=re.compile(r'\$\d+')))
         if price_tag:
-            if hasattr(price_tag, 'get_text'):
-                product['price'] = price_tag.get_text(strip=True)
-            else:
-                product['price'] = price_tag.strip()
-
-        # Original Price
-        original_price_tag = card.select_one('[class*="original"]') or card.select_one('[class*="market"]')
-        if original_price_tag:
-            product['original_price'] = original_price_tag.get_text(strip=True)
-
-        # Rating
+            text = price_tag.get_text(strip=True) if hasattr(price_tag, 'get_text') else price_tag.strip()
+            product['price'] = text
+        orig_tag = card.select_one('[class*="original"]') or card.select_one('[class*="market"]')
+        if orig_tag:
+            product['original_price'] = orig_tag.get_text(strip=True)
         rating_tag = card.select_one('[class*="rating"]') or card.find(text=re.compile(r'\d\.\d'))
         if rating_tag:
             text = rating_tag.get_text(strip=True) if hasattr(rating_tag, 'get_text') else rating_tag
             match = re.search(r'(\d\.\d)', text)
             if match:
                 product['rating'] = float(match.group(1))
-
-        # Sold count
         sold_tag = card.select_one('[class*="sold"]') or card.find(text=re.compile(r'\d+[KkMm]?\+?\s*sold'))
         if sold_tag:
             text = sold_tag.get_text(strip=True) if hasattr(sold_tag, 'get_text') else sold_tag
             product['sold_count'] = text.strip()
-
-        # Image
         img_tag = card.select_one('img[src*="kwcdn.com"]') or card.select_one('img[data-src*="kwcdn.com"]')
         if img_tag:
             product['image'] = img_tag.get('src') or img_tag.get('data-src')
-
-        # Discount
         discount_tag = card.select_one('[class*="discount"]') or card.find(text=re.compile(r'-?\d+%'))
         if discount_tag:
             text = discount_tag.get_text(strip=True) if hasattr(discount_tag, 'get_text') else discount_tag
             match = re.search(r'(\d+)%', text)
             if match:
                 product['discount_percent'] = int(match.group(1))
-
         if product.get('title') or product.get('product_id'):
             products.append(product)
-
     return products
 
-
-# ─── Helper: Parse Product Detail Page ─────────────────────────────
 def parse_product_detail(html, product_url):
-    """Extract full product details from Temu product page."""
     soup = BeautifulSoup(html, 'lxml')
     data = {
         'product_url': product_url,
-        'title': None,
-        'price': None,
-        'original_price': None,
-        'currency': None,
-        'rating': None,
-        'review_count': None,
-        'sold_count': None,
-        'description': None,
-        'images': [],
-        'colors': [],
-        'sizes': [],
-        'specs': {},
-        'store_info': {},
-        'variants': [],
+        'title': None, 'price': None, 'original_price': None,
+        'currency': None, 'rating': None, 'review_count': None,
+        'sold_count': None, 'description': None,
+        'images': [], 'colors': [], 'sizes': [],
+        'specs': {}, 'store_info': {}, 'variants': [],
     }
-
-    # ── Title ──
-    title_selectors = [
-        'h1[data-testid="product-title"]',
-        'h1[class*="title"]',
-        'h1',
-        'div[class*="product-name"] h1',
-        'span[class*="product-title"]',
-    ]
-    for sel in title_selectors:
+    for sel in ['h1[data-testid="product-title"]', 'h1[class*="title"]', 'h1', 
+                'div[class*="product-name"] h1', 'span[class*="product-title"]']:
         tag = soup.select_one(sel)
         if tag:
             data['title'] = tag.get_text(strip=True)
             break
-
-    # ── Price ──
-    price_patterns = [
-        'span[class*="price"]',
-        'div[class*="price"]',
-        'span[class*="_2de9"]',
-        '[class*="current-price"]',
-    ]
-    for sel in price_patterns:
+    for sel in ['span[class*="price"]', 'div[class*="price"]', 'span[class*="_2de9"]', '[class*="current-price"]']:
         tag = soup.select_one(sel)
         if tag:
             text = tag.get_text(strip=True)
-            # Extract currency and amount
-            match = re.search(r'([A-Z]{3})?\s*([$€£¥])?\s*([\d,]+\.?\d*)', text)
-            if match:
-                data['price'] = text
-                if match.group(1):
-                    data['currency'] = match.group(1)
+            data['price'] = text
             break
-
-    # ── Original Price ──
     orig_tag = soup.select_one('[class*="original-price"]') or soup.select_one('[class*="market-price"]')
     if orig_tag:
         data['original_price'] = orig_tag.get_text(strip=True)
-
-    # ── Rating & Reviews ──
     rating_tag = soup.find(text=re.compile(r'\d\.\d'))
     if rating_tag:
         parent = rating_tag.parent
@@ -218,19 +226,14 @@ def parse_product_detail(html, product_url):
             match = re.search(r'(\d\.\d)', parent.get_text())
             if match:
                 data['rating'] = float(match.group(1))
-
     review_tag = soup.find(text=re.compile(r'\d+\s*reviews?', re.I))
     if review_tag:
         match = re.search(r'(\d+)', review_tag)
         if match:
             data['review_count'] = int(match.group(1))
-
-    # ── Sold Count ──
     sold_tag = soup.find(text=re.compile(r'\d+[KkMm]?\+?\s*sold', re.I))
     if sold_tag:
         data['sold_count'] = sold_tag.strip()
-
-    # ── Images (Gallery) ──
     img_tags = soup.select('img[src*="kwcdn.com"]') + soup.select('img[data-src*="kwcdn.com"]')
     seen = set()
     for img in img_tags:
@@ -238,84 +241,54 @@ def parse_product_detail(html, product_url):
         if src and src not in seen and 'thumbnail' not in src.lower():
             seen.add(src)
             data['images'].append(src)
-
-    # ── Colors ──
-    color_tags = soup.select('[class*="color"]') + soup.select('[class*="colour"]')
-    for tag in color_tags:
+    for tag in soup.select('[class*="color"]') + soup.select('[class*="colour"]'):
         text = tag.get_text(strip=True)
         if text and len(text) < 50 and text not in data['colors']:
             data['colors'].append(text)
-
-    # Also look for color swatches
-    swatches = soup.select('[class*="swatch"]') + soup.select('[class*="sku-item"]')
-    for swatch in swatches:
+    for swatch in soup.select('[class*="swatch"]') + soup.select('[class*="sku-item"]'):
         text = swatch.get_text(strip=True)
         if text and text not in data['colors'] and len(text) < 50:
             data['colors'].append(text)
-
-    # ── Sizes ──
-    size_tags = soup.select('[class*="size"]') + soup.select('[class*="dimension"]')
-    for tag in size_tags:
+    for tag in soup.select('[class*="size"]') + soup.select('[class*="dimension"]'):
         text = tag.get_text(strip=True)
         if text and text not in data['sizes'] and len(text) < 30:
             data['sizes'].append(text)
-
-    # ── Description ──
     desc_tag = soup.select_one('[class*="description"]') or soup.select_one('[class*="detail"]')
     if desc_tag:
         data['description'] = desc_tag.get_text(strip=True)[:500]
-
-    # ── Specs / Details ──
-    spec_rows = soup.select('[class*="spec"]') + soup.select('table tr')
-    for row in spec_rows:
+    for row in soup.select('[class*="spec"]') + soup.select('table tr'):
         cells = row.select('td, th, div')
         if len(cells) >= 2:
             key = cells[0].get_text(strip=True)
             val = cells[1].get_text(strip=True)
             if key and val and len(key) < 50:
                 data['specs'][key] = val
-
-    # ── Store Info ──
     store_tag = soup.select_one('[class*="store"]') or soup.select_one('[class*="mall"]')
     if store_tag:
         data['store_info']['name'] = store_tag.get_text(strip=True)
-
-    # ── Try to extract JSON-LD or page data ──
-    scripts = soup.find_all('script', type='application/ld+json')
-    for script in scripts:
+    for script in soup.find_all('script', type='application/ld+json'):
         try:
             ld = json.loads(script.string)
-            if isinstance(ld, dict):
-                if ld.get('@type') == 'Product':
-                    data['title'] = data['title'] or ld.get('name')
-                    if ld.get('offers'):
-                        offers = ld['offers']
-                        if isinstance(offers, list):
-                            offers = offers[0]
-                        data['price'] = data['price'] or offers.get('price')
-                        data['currency'] = data['currency'] or offers.get('priceCurrency')
-                    data['description'] = data['description'] or ld.get('description', '')[:500]
-                    if ld.get('image'):
-                        if isinstance(ld['image'], str):
-                            if ld['image'] not in data['images']:
-                                data['images'].insert(0, ld['image'])
-                        elif isinstance(ld['image'], list):
-                            for img in ld['image']:
-                                if img not in data['images']:
-                                    data['images'].append(img)
+            if isinstance(ld, dict) and ld.get('@type') == 'Product':
+                data['title'] = data['title'] or ld.get('name')
+                if ld.get('offers'):
+                    offers = ld['offers'][0] if isinstance(ld['offers'], list) else ld['offers']
+                    data['price'] = data['price'] or offers.get('price')
+                    data['currency'] = data['currency'] or offers.get('priceCurrency')
+                data['description'] = data['description'] or ld.get('description', '')[:500]
+                if ld.get('image'):
+                    imgs = [ld['image']] if isinstance(ld['image'], str) else ld['image']
+                    for img in imgs:
+                        if img not in data['images']:
+                            data['images'].append(img)
         except:
             pass
-
-    # ── Try window.__INITIAL_STATE__ or similar ──
-    scripts_js = soup.find_all('script')
-    for script in scripts_js:
+    for script in soup.find_all('script'):
         if script.string and ('initialState' in script.string or 'goodsInfo' in script.string):
             try:
-                # Extract JSON from JS variable
                 match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.+?});', script.string, re.DOTALL)
                 if match:
                     state = json.loads(match.group(1))
-                    # Navigate to product data if present
                     if 'goodsInfo' in state:
                         goods = state['goodsInfo']
                         data['title'] = data['title'] or goods.get('goodsName')
@@ -328,9 +301,7 @@ def parse_product_detail(html, product_url):
                                     'original_price': sku.get('marketPrice'),
                                     'available': sku.get('isOnsale'),
                                 }
-                                # Extract color/size from specs
-                                specs = sku.get('specs', [])
-                                for spec in specs:
+                                for spec in sku.get('specs', []):
                                     spec_name = spec.get('specName', '').lower()
                                     spec_value = spec.get('specValue', '')
                                     if 'color' in spec_name or 'colour' in spec_name:
@@ -344,102 +315,111 @@ def parse_product_detail(html, product_url):
                                 data['variants'].append(variant)
             except:
                 pass
-
-    # Clean up empty lists
     data['colors'] = list(dict.fromkeys(data['colors']))[:20]
     data['sizes'] = list(dict.fromkeys(data['sizes']))[:20]
     data['images'] = data['images'][:15]
-
     return data
-
-
-# ═══════════════════════════════════════════════════════════════════
-# API ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════
 
 @app.route('/')
 def home():
     return jsonify({
-        "service": "Temu Scraper API",
-        "powered_by": "Oxylabs",
+        "service": "Temu Scraper API with Cache",
+        "powered_by": "Oxylabs Web Scraper API",
+        "database": "SQLite (cached for " + str(CACHE_DAYS) + " days)",
         "endpoints": {
-            "GET /search?q=<keyword>&limit=<n>": "Search Temu products by keyword",
-            "GET /product?url=<temu_url>": "Get full product details (images, colors, sizes, prices)",
+            "GET /search?q=<keyword>&limit=<n>": "Search products (cached)",
+            "GET /product?url=<temu_url>": "Get product details (cached)",
             "POST /product": {"body": {"url": "temu product url"}},
-        },
-        "note": "Temu changes their frontend frequently. Selectors may need updates."
+            "GET /stats": "View cache statistics",
+            "GET /health": "Check API health"
+        }
     })
-
 
 @app.route('/search', methods=['GET'])
 def search_products():
-    """Search Temu by keyword."""
     query = request.args.get('q', '').strip()
     limit = min(int(request.args.get('limit', 12)), 24)
-    locale = request.args.get('locale', 'en')
-
     if not query:
         return jsonify({"error": "Missing 'q' parameter"}), 400
-
-    # Build Temu search URL
+    cached = get_cached_search(query)
+    if cached:
+        products = cached[:limit]
+        return jsonify({
+            "success": True,
+            "source": "cache",
+            "query": query,
+            "count": len(products),
+            "products": products
+        })
     search_url = f"https://www.temu.com/search_result.html?search_key={quote(query)}"
-    if locale != 'en':
-        search_url += f"&locale={locale}"
-
-    html = fetch_oxylabs(search_url, render_js=True)
+    html = fetch_oxylabs(search_url, timeout=60)
     if not html:
-        return jsonify({"error": "Failed to fetch search results. Check Oxylabs credentials."}), 502
-
-    products = parse_search_results(html)
-
-    # Limit results
-    products = products[:limit]
-
+        return jsonify({"error": "Failed to fetch search results. Check Oxylabs credentials or API limit."}), 502
+    products = parse_search_results(html)[:limit]
+    if products:
+        save_search_cache(query, products)
     return jsonify({
         "success": True,
+        "source": "oxylabs",
         "query": query,
         "count": len(products),
         "products": products
     })
 
-
 @app.route('/product', methods=['GET', 'POST'])
 def product_detail():
-    """Get full product details from Temu product URL."""
     if request.method == 'POST':
         body = request.get_json() or {}
         product_url = body.get('url', '').strip()
     else:
         product_url = request.args.get('url', '').strip()
-
     if not product_url:
         return jsonify({"error": "Missing 'url' parameter"}), 400
-
     if not product_url.startswith('http'):
         product_url = 'https://www.temu.com' + product_url
-
-    # Validate it's a Temu URL
     if 'temu.com' not in product_url:
         return jsonify({"error": "Invalid Temu URL"}), 400
-
-    html = fetch_oxylabs(product_url, render_js=True, timeout=60)
+    cached = get_cached_product(product_url)
+    if cached:
+        return jsonify({
+            "success": True,
+            "source": "cache",
+            "product": cached
+        })
+    html = fetch_oxylabs(product_url, timeout=90)
     if not html:
-        return jsonify({"error": "Failed to fetch product page. Check Oxylabs credentials or URL."}), 502
-
+        return jsonify({"error": "Failed to fetch product page. Check Oxylabs credentials or API limit."}), 502
     data = parse_product_detail(html, product_url)
-
+    save_product_cache(product_url, data)
     return jsonify({
         "success": True,
+        "source": "oxylabs",
         "product": data
     })
 
+@app.route('/stats')
+def stats():
+    conn = get_db()
+    search_count = conn.execute("SELECT COUNT(*) as c FROM search_cache").fetchone()['c']
+    product_count = conn.execute("SELECT COUNT(*) as c FROM product_cache").fetchone()['c']
+    conn.close()
+    return jsonify({
+        "cached_searches": search_count,
+        "cached_products": product_count,
+        "cache_duration_days": CACHE_DAYS,
+        "oxylabs_configured": bool(OXYLABS_USER and OXYLABS_PASS)
+    })
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "oxylabs_configured": bool(OXYLABS_USER and OXYLABS_PASS)})
+    return jsonify({
+        "status": "ok",
+        "oxylabs_configured": bool(OXYLABS_USER and OXYLABS_PASS),
+        "database_path": DB_PATH
+    })
 
+init_db()
 
-# ═══════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
