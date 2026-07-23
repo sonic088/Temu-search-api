@@ -111,7 +111,6 @@ def fetch_scrapingbee(target_url, timeout=60):
         "premium_proxy": "true",
         "country_code": "us",
         "wait": "8000",
-        "wait_for": "div[data-testid='product-card'], div[class*='goods-item'], script",
     }
 
     try:
@@ -247,121 +246,161 @@ def get_mock_product_detail(product_url):
         ]
     }
 
-# ===================== JSON EXTRACTORS (NEW) =====================
+# ===================== ADVANCED JSON EXTRACTORS =====================
 
-def extract_json_from_scripts(html):
-    """Extract all JSON objects from script tags in HTML."""
+def extract_all_window_vars(html):
+    """Extract ALL window.* variables from script tags."""
     soup = BeautifulSoup(html, 'html.parser')
-    all_data = []
+    all_vars = {}
 
     for script in soup.find_all('script'):
         if not script.string:
             continue
-        text = script.string.strip()
-        if len(text) < 100:
-            continue
+        text = script.string
 
-        # Try to find window.__INITIAL_STATE__ or similar
-        patterns = [
-            r'window\.__INITIAL_STATE__\s*=\s*({.+?});',
-            r'window\._SSR_HYDRATED_DATA\s*=\s*({.+?});',
-            r'window\.__data\s*=\s*({.+?});',
-            r'window\.__APP_DATA\s*=\s*({.+?});',
-            r'window\.__PRELOADED_STATE__\s*=\s*({.+?});',
-            r'window\.__INITIAL_DATA__\s*=\s*({.+?});',
-        ]
+        # Find all window.VAR_NAME = {...} or window.VAR_NAME = [...]
+        # Pattern: window.XXX = { ... }; or window.XXX = [ ... ];
+        pattern = r'window\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*({.*?};|\[.*?\];)'
+        # Better pattern that handles nested braces
+        matches = re.finditer(r'window\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*', text)
 
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.DOTALL)
-            for match in matches:
-                try:
-                    data = json.loads(match)
-                    all_data.append(data)
-                except:
-                    pass
+        for match in matches:
+            var_name = match.group(1)
+            start = match.end()
 
-        # Also try to find any large JSON object in the script
-        # Look for JSON that starts with { and has "goods" or "product" or "item"
-        if 'goods' in text or 'product' in text or 'itemList' in text:
-            # Try to extract the largest JSON object
-            brace_count = 0
-            start_idx = -1
-            for i, char in enumerate(text):
-                if char == '{':
-                    if brace_count == 0:
-                        start_idx = i
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0 and start_idx != -1:
-                        try:
-                            obj = json.loads(text[start_idx:i+1])
-                            all_data.append(obj)
-                        except:
-                            pass
-                        start_idx = -1
+            # Find the matching end of the object/array
+            first_char = text[start:start+1].strip()
+            if first_char not in ['{', '[']:
+                continue
 
-    return all_data
+            opener = first_char
+            closer = '}' if opener == '{' else ']'
 
-def find_products_in_json(data, path=""):
-    """Recursively search for product arrays in JSON data."""
+            depth = 0
+            in_string = False
+            string_char = None
+            escape_next = False
+
+            for i in range(start, len(text)):
+                char = text[i]
+
+                if escape_next:
+                    escape_next = False
+                    continue
+
+                if char == '\\':
+                    escape_next = True
+                    continue
+
+                if char in ['"', "'"]:
+                    if not in_string:
+                        in_string = True
+                        string_char = char
+                    elif char == string_char:
+                        in_string = False
+                        string_char = None
+                    continue
+
+                if not in_string:
+                    if char == opener:
+                        depth += 1
+                    elif char == closer:
+                        depth -= 1
+                        if depth == 0:
+                            # Found complete object
+                            json_str = text[start:i+1]
+                            try:
+                                data = json.loads(json_str)
+                                all_vars[var_name] = data
+                            except:
+                                pass
+                            break
+
+    return all_vars
+
+def find_products_in_data(data, depth=0, max_depth=10):
+    """Recursively find product arrays/objects in any JSON structure."""
+    if depth > max_depth:
+        return []
+
     products = []
 
     if isinstance(data, dict):
-        # Check if this dict looks like a product
-        if any(k in data for k in ['goodsId', 'goods_id', 'productId', 'itemId', 'skuId']):
-            if any(k in data for k in ['goodsName', 'title', 'productName', 'itemName', 'price']):
+        # Check if this dict itself is a product
+        product_keys = ['goodsId', 'goods_id', 'productId', 'itemId', 'skuId', 'goodsName', 'title', 'productName']
+        if any(k in data for k in product_keys):
+            # It might be a product if it has a name/title
+            if any(k in data for k in ['goodsName', 'title', 'productName', 'itemName', 'name']):
                 products.append(data)
 
-        # Check for arrays that might contain products
+        # Search in values
         for key, value in data.items():
+            # Check if key suggests products
             if isinstance(value, list) and len(value) > 0:
-                # Check if first item looks like a product
-                if isinstance(value[0], dict):
-                    if any(k in value[0] for k in ['goodsId', 'goods_id', 'productId', 'itemId', 'title', 'goodsName']):
-                        products.extend(value)
-                    else:
-                        # Recursively search
-                        for item in value:
-                            products.extend(find_products_in_json(item, f"{path}.{key}[]"))
+                if key.lower() in ['goods', 'products', 'items', 'skus', 'list', 'data', 'result', 'results', 'goodslist', 'productlist', 'itemlist']:
+                    # Check first item
+                    if isinstance(value[0], dict):
+                        if any(k in value[0] for k in product_keys + ['goodsName', 'title', 'name']):
+                            products.extend(value)
+                            continue
+                # Recursively search list items
+                for item in value:
+                    products.extend(find_products_in_data(item, depth + 1, max_depth))
             elif isinstance(value, dict):
-                products.extend(find_products_in_json(value, f"{path}.{key}"))
+                products.extend(find_products_in_data(value, depth + 1, max_depth))
+
+    elif isinstance(data, list):
+        for item in data:
+            products.extend(find_products_in_data(item, depth + 1, max_depth))
 
     return products
 
 def normalize_product(raw_product):
-    """Convert raw Temu product data to our standard format."""
+    """Convert raw Temu product data to standard format."""
     product = {}
 
     # Product ID
-    product['product_id'] = (raw_product.get('goodsId') or 
+    product['product_id'] = str(raw_product.get('goodsId') or 
                               raw_product.get('goods_id') or 
                               raw_product.get('productId') or 
-                              raw_product.get('itemId') or '')
+                              raw_product.get('itemId') or 
+                              raw_product.get('id') or '')
 
     # Title
     product['title'] = (raw_product.get('goodsName') or 
                         raw_product.get('title') or 
                         raw_product.get('productName') or 
-                        raw_product.get('itemName') or '')
+                        raw_product.get('itemName') or 
+                        raw_product.get('name') or '')
 
-    # Price
+    # Price - try multiple fields
     price = (raw_product.get('price') or 
              raw_product.get('salePrice') or 
              raw_product.get('minOnSalePrice') or 
-             raw_product.get('minPrice') or '')
+             raw_product.get('minPrice') or 
+             raw_product.get('sale_price') or '')
     if price:
-        product['price'] = f"${price}" if not str(price).startswith('$') else str(price)
+        price_str = str(price)
+        if not price_str.startswith('$'):
+            price_str = f"${price_str}"
+        product['price'] = price_str
 
     # Original price
     orig_price = (raw_product.get('marketPrice') or 
                   raw_product.get('originalPrice') or 
-                  raw_product.get('maxPrice') or '')
+                  raw_product.get('maxPrice') or 
+                  raw_product.get('original_price') or '')
     if orig_price:
-        product['original_price'] = f"${orig_price}" if not str(orig_price).startswith('$') else str(orig_price)
+        orig_str = str(orig_price)
+        if not orig_str.startswith('$'):
+            orig_str = f"${orig_str}"
+        product['original_price'] = orig_str
 
     # Rating
-    rating = raw_product.get('goodsStar') or raw_product.get('rating') or raw_product.get('avgStar')
+    rating = (raw_product.get('goodsStar') or 
+              raw_product.get('rating') or 
+              raw_product.get('avgStar') or 
+              raw_product.get('star') or '')
     if rating:
         try:
             product['rating'] = float(rating)
@@ -371,7 +410,8 @@ def normalize_product(raw_product):
     # Sold count
     sold = (raw_product.get('sales') or 
             raw_product.get('soldQuantity') or 
-            raw_product.get('soldCount') or '')
+            raw_product.get('soldCount') or 
+            raw_product.get('sold') or '')
     if sold:
         product['sold_count'] = str(sold)
 
@@ -379,7 +419,9 @@ def normalize_product(raw_product):
     img = (raw_product.get('thumbUrl') or 
            raw_product.get('imageUrl') or 
            raw_product.get('mainImage') or 
-           raw_product.get('thumb') or '')
+           raw_product.get('thumb') or 
+           raw_product.get('image') or 
+           raw_product.get('imgUrl') or '')
     if img:
         if img.startswith('//'):
             img = 'https:' + img
@@ -389,6 +431,10 @@ def normalize_product(raw_product):
     goods_id = product.get('product_id')
     if goods_id:
         product['product_url'] = f"https://www.temu.com/goods.html?goods_id={goods_id}"
+    elif raw_product.get('link'):
+        product['product_url'] = raw_product.get('link')
+    elif raw_product.get('url'):
+        product['product_url'] = raw_product.get('url')
 
     # Discount
     if product.get('price') and product.get('original_price'):
@@ -400,97 +446,119 @@ def normalize_product(raw_product):
         except:
             pass
 
+    # Also check for explicit discount
+    discount = raw_product.get('discount') or raw_product.get('discountRate')
+    if discount and not product.get('discount_percent'):
+        try:
+            product['discount_percent'] = int(float(discount))
+        except:
+            pass
+
     return product
 
 # ===================== PARSERS =====================
 
 def parse_search_results(html):
-    """Extract products from HTML using JSON in script tags."""
+    """Extract products from HTML using all possible methods."""
     products = []
+    debug_info = {"methods_tried": []}
 
-    # Method 1: Extract JSON from scripts
-    json_data_list = extract_json_from_scripts(html)
+    # Method 1: Extract ALL window variables and search for products
+    try:
+        window_vars = extract_all_window_vars(html)
+        debug_info["window_vars_found"] = list(window_vars.keys())
+        debug_info["methods_tried"].append("window_vars")
 
-    for data in json_data_list:
-        raw_products = find_products_in_json(data)
-        for raw in raw_products:
-            product = normalize_product(raw)
-            if product.get('title') or product.get('product_id'):
-                products.append(product)
+        for var_name, data in window_vars.items():
+            # Skip obvious config variables
+            if any(skip in var_name.lower() for skip in ['config', 'cdn', 'img', 'npm', 'package', 'locale', 'i18n']):
+                continue
 
-    # Method 2: Fallback to DOM parsing if no JSON products found
+            found = find_products_in_data(data)
+            if found:
+                debug_info[f"products_from_{var_name}"] = len(found)
+                for raw in found:
+                    product = normalize_product(raw)
+                    if product.get('title') or product.get('product_id'):
+                        products.append(product)
+    except Exception as e:
+        debug_info["window_vars_error"] = str(e)
+
+    # Method 2: Look for JSON-LD
     if not products:
-        soup = BeautifulSoup(html, 'html.parser')
-        cards = (
-            soup.select('div[data-testid="product-card"]') or
-            soup.select('div[class*="goods-item"]') or
-            soup.select('div[class*="product-card"]') or
-            soup.select('a[href*="goods.html"]') or
-            soup.find_all('div', class_=re.compile(r'.*goods.*'))
-        )
-        for card in cards[:24]:
-            product = {}
-            link_tag = card if card.name == 'a' else card.find('a', href=re.compile(r'goods_id'))
-            if link_tag and link_tag.get('href'):
-                href = link_tag['href']
-                if href.startswith('/'):
-                    href = 'https://www.temu.com' + href
-                product['product_url'] = href
-                match = re.search(r'goods_id[=:](\d+)', href)
-                if match:
-                    product['product_id'] = match.group(1)
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            for script in soup.find_all('script', type='application/ld+json'):
+                try:
+                    ld = json.loads(script.string)
+                    if isinstance(ld, dict) and ld.get('@type') == 'ItemList':
+                        for item in ld.get('itemListElement', []):
+                            if isinstance(item, dict):
+                                p = item.get('item', {})
+                                if p:
+                                    products.append(normalize_product(p))
+                except:
+                    pass
+            debug_info["methods_tried"].append("json_ld")
+        except:
+            pass
 
-            title_tag = (card.select_one('[class*="title"]') or card.select_one('h2') or 
-                         card.select_one('h3') or card.select_one('span[class*="title"]'))
-            if title_tag:
-                product['title'] = title_tag.get_text(strip=True)
+    # Method 3: DOM fallback
+    if not products:
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            cards = (
+                soup.select('div[data-testid="product-card"]') or
+                soup.select('div[class*="goods-item"]') or
+                soup.select('div[class*="product-card"]') or
+                soup.select('a[href*="goods.html"]') or
+                soup.find_all('div', class_=re.compile(r'.*goods.*'))
+            )
+            for card in cards[:24]:
+                product = {}
+                link_tag = card if card.name == 'a' else card.find('a', href=re.compile(r'goods_id'))
+                if link_tag and link_tag.get('href'):
+                    href = link_tag['href']
+                    if href.startswith('/'):
+                        href = 'https://www.temu.com' + href
+                    product['product_url'] = href
+                    match = re.search(r'goods_id[=:](\d+)', href)
+                    if match:
+                        product['product_id'] = match.group(1)
 
-            price_tag = (card.select_one('[class*="price"]') or card.select_one('span[class*="_2de9"]') or
-                         card.find(text=re.compile(r'\$\d+')))
-            if price_tag:
-                text = price_tag.get_text(strip=True) if hasattr(price_tag, 'get_text') else price_tag.strip()
-                product['price'] = text
+                title_tag = (card.select_one('[class*="title"]') or card.select_one('h2') or 
+                             card.select_one('h3') or card.select_one('span[class*="title"]'))
+                if title_tag:
+                    product['title'] = title_tag.get_text(strip=True)
 
-            orig_tag = card.select_one('[class*="original"]') or card.select_one('[class*="market"]')
-            if orig_tag:
-                product['original_price'] = orig_tag.get_text(strip=True)
+                price_tag = (card.select_one('[class*="price"]') or card.select_one('span[class*="_2de9"]') or
+                             card.find(text=re.compile(r'\$\d+')))
+                if price_tag:
+                    text = price_tag.get_text(strip=True) if hasattr(price_tag, 'get_text') else price_tag.strip()
+                    product['price'] = text
 
-            rating_tag = card.select_one('[class*="rating"]') or card.find(text=re.compile(r'\d\.\d'))
-            if rating_tag:
-                text = rating_tag.get_text(strip=True) if hasattr(rating_tag, 'get_text') else rating_tag
-                match = re.search(r'(\d\.\d)', text)
-                if match:
-                    product['rating'] = float(match.group(1))
+                img_tag = card.select_one('img[src*="kwcdn.com"]') or card.select_one('img[data-src*="kwcdn.com"]')
+                if img_tag:
+                    product['image'] = img_tag.get('src') or img_tag.get('data-src')
 
-            sold_tag = card.select_one('[class*="sold"]') or card.find(text=re.compile(r'\d+[KkMm]?\+?\s*sold'))
-            if sold_tag:
-                text = sold_tag.get_text(strip=True) if hasattr(sold_tag, 'get_text') else sold_tag
-                product['sold_count'] = text.strip()
+                if product.get('title') or product.get('product_id'):
+                    products.append(product)
+            debug_info["methods_tried"].append("dom")
+            debug_info["dom_cards_found"] = len(cards)
+        except Exception as e:
+            debug_info["dom_error"] = str(e)
 
-            img_tag = card.select_one('img[src*="kwcdn.com"]') or card.select_one('img[data-src*="kwcdn.com"]')
-            if img_tag:
-                product['image'] = img_tag.get('src') or img_tag.get('data-src')
-
-            discount_tag = card.select_one('[class*="discount"]') or card.find(text=re.compile(r'-?\d+%'))
-            if discount_tag:
-                text = discount_tag.get_text(strip=True) if hasattr(discount_tag, 'get_text') else discount_tag
-                match = re.search(r'(\d+)%', text)
-                if match:
-                    product['discount_percent'] = int(match.group(1))
-
-            if product.get('title') or product.get('product_id'):
-                products.append(product)
-
-    # Remove duplicates by product_id
+    # Remove duplicates
     seen = set()
     unique = []
     for p in products:
-        pid = p.get('product_id', p.get('title', ''))
+        pid = p.get('product_id') or p.get('title', '')
         if pid and pid not in seen:
             seen.add(pid)
             unique.append(p)
 
-    return unique
+    debug_info["total_unique_products"] = len(unique)
+    return unique, debug_info
 
 def parse_product_detail(html, product_url):
     soup = BeautifulSoup(html, 'html.parser')
@@ -501,75 +569,82 @@ def parse_product_detail(html, product_url):
         'specs': {}, 'store_info': {}, 'variants': [],
     }
 
-    # Try JSON extraction first
-    json_data_list = extract_json_from_scripts(html)
-    for json_data in json_data_list:
-        # Look for goods info
-        goods = None
-        if isinstance(json_data, dict):
-            if 'goodsInfo' in json_data:
-                goods = json_data['goodsInfo']
-            elif 'goods' in json_data:
-                goods = json_data['goods']
-            elif 'product' in json_data:
-                goods = json_data['product']
+    # Try window variables first
+    try:
+        window_vars = extract_all_window_vars(html)
+        for var_name, var_data in window_vars.items():
+            if any(skip in var_name.lower() for skip in ['config', 'cdn', 'npm', 'package', 'locale']):
+                continue
 
-        if goods and isinstance(goods, dict):
-            data['title'] = data['title'] or goods.get('goodsName') or goods.get('title')
-            data['description'] = data['description'] or goods.get('goodsDesc', '')[:500]
+            # Look for goods info
+            goods = None
+            if isinstance(var_data, dict):
+                if 'goodsInfo' in var_data:
+                    goods = var_data['goodsInfo']
+                elif 'goods' in var_data and isinstance(var_data['goods'], dict):
+                    goods = var_data['goods']
+                elif 'product' in var_data and isinstance(var_data['product'], dict):
+                    goods = var_data['product']
 
-            price = goods.get('price') or goods.get('salePrice') or goods.get('minOnSalePrice')
-            if price:
-                data['price'] = f"${price}" if not str(price).startswith('$') else str(price)
+            if goods and isinstance(goods, dict):
+                data['title'] = data['title'] or goods.get('goodsName') or goods.get('title') or goods.get('name')
+                data['description'] = data['description'] or goods.get('goodsDesc', '')[:500] or goods.get('description', '')[:500]
 
-            orig = goods.get('marketPrice') or goods.get('originalPrice')
-            if orig:
-                data['original_price'] = f"${orig}" if not str(orig).startswith('$') else str(orig)
+                price = (goods.get('price') or goods.get('salePrice') or goods.get('minOnSalePrice') or goods.get('sale_price'))
+                if price and not data['price']:
+                    data['price'] = f"${price}" if not str(price).startswith('$') else str(price)
 
-            rating = goods.get('goodsStar') or goods.get('avgStar') or goods.get('rating')
-            if rating:
-                try:
-                    data['rating'] = float(rating)
-                except:
-                    pass
+                orig = goods.get('marketPrice') or goods.get('originalPrice') or goods.get('original_price')
+                if orig and not data['original_price']:
+                    data['original_price'] = f"${orig}" if not str(orig).startswith('$') else str(orig)
 
-            sold = goods.get('sales') or goods.get('soldQuantity')
-            if sold:
-                data['sold_count'] = str(sold)
+                rating = goods.get('goodsStar') or goods.get('avgStar') or goods.get('rating') or goods.get('star')
+                if rating and not data['rating']:
+                    try:
+                        data['rating'] = float(rating)
+                    except:
+                        pass
 
-            # Images
-            imgs = goods.get('thumbUrlList') or goods.get('imageUrlList') or goods.get('images') or []
-            if isinstance(imgs, list):
-                for img in imgs:
-                    if img and img not in data['images']:
-                        if img.startswith('//'):
-                            img = 'https:' + img
-                        data['images'].append(img)
+                sold = goods.get('sales') or goods.get('soldQuantity') or goods.get('soldCount') or goods.get('sold')
+                if sold and not data['sold_count']:
+                    data['sold_count'] = str(sold)
 
-            # Variants/SKUs
-            sku_list = goods.get('skuList') or goods.get('skus') or []
-            for sku in sku_list:
-                variant = {
-                    'sku_id': sku.get('skuId') or sku.get('id'),
-                    'price': sku.get('price') or sku.get('salePrice'),
-                    'original_price': sku.get('marketPrice'),
-                    'available': sku.get('isOnsale') or sku.get('inStock'),
-                }
-                specs = sku.get('specs') or sku.get('specifications') or []
-                for spec in specs:
-                    name = (spec.get('specName') or spec.get('name') or '').lower()
-                    value = spec.get('specValue') or spec.get('value') or ''
-                    if 'color' in name or 'colour' in name:
-                        variant['color'] = value
-                        if value not in data['colors']:
-                            data['colors'].append(value)
-                    elif 'size' in name or 'dimension' in name:
-                        variant['size'] = value
-                        if value not in data['sizes']:
-                            data['sizes'].append(value)
-                data['variants'].append(variant)
+                # Images
+                imgs = (goods.get('thumbUrlList') or goods.get('imageUrlList') or goods.get('images') or 
+                        goods.get('imgUrlList') or goods.get('gallery') or [])
+                if isinstance(imgs, list):
+                    for img in imgs:
+                        if img and img not in data['images']:
+                            if img.startswith('//'):
+                                img = 'https:' + img
+                            data['images'].append(img)
 
-    # Fallback to DOM parsing
+                # Variants/SKUs
+                sku_list = goods.get('skuList') or goods.get('skus') or goods.get('sku_list') or []
+                for sku in sku_list:
+                    variant = {
+                        'sku_id': sku.get('skuId') or sku.get('id') or sku.get('sku_id'),
+                        'price': sku.get('price') or sku.get('salePrice') or sku.get('sale_price'),
+                        'original_price': sku.get('marketPrice') or sku.get('originalPrice'),
+                        'available': sku.get('isOnsale') or sku.get('inStock') or sku.get('available'),
+                    }
+                    specs = sku.get('specs') or sku.get('specifications') or sku.get('skuSpecs') or []
+                    for spec in specs:
+                        name = (spec.get('specName') or spec.get('name') or '').lower()
+                        value = spec.get('specValue') or spec.get('value') or spec.get('spec_value') or ''
+                        if 'color' in name or 'colour' in name:
+                            variant['color'] = value
+                            if value not in data['colors']:
+                                data['colors'].append(value)
+                        elif 'size' in name or 'dimension' in name:
+                            variant['size'] = value
+                            if value not in data['sizes']:
+                                data['sizes'].append(value)
+                    data['variants'].append(variant)
+    except:
+        pass
+
+    # Fallback to DOM
     if not data['title']:
         for sel in ['h1[data-testid="product-title"]', 'h1[class*="title"]', 'h1', 
                     'div[class*="product-name"] h1', 'span[class*="product-title"]']:
@@ -585,29 +660,6 @@ def parse_product_detail(html, product_url):
                 data['price'] = tag.get_text(strip=True)
                 break
 
-    orig_tag = soup.select_one('[class*="original-price"]') or soup.select_one('[class*="market-price"]')
-    if orig_tag and not data['original_price']:
-        data['original_price'] = orig_tag.get_text(strip=True)
-
-    if not data['rating']:
-        rating_tag = soup.find(text=re.compile(r'\d\.\d'))
-        if rating_tag:
-            parent = rating_tag.parent
-            if parent:
-                match = re.search(r'(\d\.\d)', parent.get_text())
-                if match:
-                    data['rating'] = float(match.group(1))
-
-    review_tag = soup.find(text=re.compile(r'\d+\s*reviews?', re.I))
-    if review_tag:
-        match = re.search(r'(\d+)', review_tag)
-        if match:
-            data['review_count'] = int(match.group(1))
-
-    sold_tag = soup.find(text=re.compile(r'\d+[KkMm]?\+?\s*sold', re.I))
-    if sold_tag and not data['sold_count']:
-        data['sold_count'] = sold_tag.strip()
-
     if not data['images']:
         img_tags = soup.select('img[src*="kwcdn.com"]') + soup.select('img[data-src*="kwcdn.com"]')
         seen = set()
@@ -616,34 +668,6 @@ def parse_product_detail(html, product_url):
             if src and src not in seen and 'thumbnail' not in src.lower():
                 seen.add(src)
                 data['images'].append(src)
-
-    if not data['colors']:
-        for tag in soup.select('[class*="color"]') + soup.select('[class*="colour"]'):
-            text = tag.get_text(strip=True)
-            if text and len(text) < 50 and text not in data['colors']:
-                data['colors'].append(text)
-
-    if not data['sizes']:
-        for tag in soup.select('[class*="size"]') + soup.select('[class*="dimension"]'):
-            text = tag.get_text(strip=True)
-            if text and text not in data['sizes'] and len(text) < 30:
-                data['sizes'].append(text)
-
-    desc_tag = soup.select_one('[class*="description"]') or soup.select_one('[class*="detail"]')
-    if desc_tag and not data['description']:
-        data['description'] = desc_tag.get_text(strip=True)[:500]
-
-    for row in soup.select('[class*="spec"]') + soup.select('table tr'):
-        cells = row.select('td, th, div')
-        if len(cells) >= 2:
-            key = cells[0].get_text(strip=True)
-            val = cells[1].get_text(strip=True)
-            if key and val and len(key) < 50:
-                data['specs'][key] = val
-
-    store_tag = soup.select_one('[class*="store"]') or soup.select_one('[class*="mall"]')
-    if store_tag:
-        data['store_info']['name'] = store_tag.get_text(strip=True)
 
     data['colors'] = list(dict.fromkeys(data['colors']))[:20]
     data['sizes'] = list(dict.fromkeys(data['sizes']))[:20]
@@ -664,7 +688,7 @@ def home():
             "POST /product": {"body": {"url": "temu product url"}},
             "GET /stats": "View cache statistics",
             "GET /health": "Check API health",
-            "GET /debug?url=<temu_url>": "Debug HTML fetch"
+            "GET /debug?url=<temu_url>": "Debug HTML structure"
         }
     })
 
@@ -688,29 +712,29 @@ def search_products():
     # 2. Try ScrapingBee (Primary)
     html, scrapingbee_error = fetch_scrapingbee(search_url, timeout=60)
     if html:
-        products = parse_search_results(html)[:limit]
+        products, debug_info = parse_search_results(html)
         if products:
             save_search_cache(query, products)
             return jsonify({"success": True, "source": "scrapingbee", "query": query, "count": len(products), "products": products})
-        scrapingbee_error = f"ScrapingBee returned {len(html)} chars but parser found 0 products"
+        scrapingbee_error = f"ScrapingBee: {json.dumps(debug_info)}"
 
     # 3. Try Oxylabs (Fallback)
     html, oxylabs_error = fetch_oxylabs(search_url, timeout=60)
     if html:
-        products = parse_search_results(html)[:limit]
+        products, debug_info = parse_search_results(html)
         if products:
             save_search_cache(query, products)
             return jsonify({"success": True, "source": "oxylabs", "query": query, "count": len(products), "products": products})
-        oxylabs_error = f"Oxylabs returned {len(html)} chars but parser found 0 products"
+        oxylabs_error = f"Oxylabs: {json.dumps(debug_info)}"
 
     # 4. Try direct scraping
     html, direct_error = fetch_direct(search_url, timeout=30)
     if html:
-        products = parse_search_results(html)[:limit]
+        products, debug_info = parse_search_results(html)
         if products:
             save_search_cache(query, products)
             return jsonify({"success": True, "source": "direct", "query": query, "count": len(products), "products": products})
-        direct_error = f"Direct returned {len(html)} chars but parser found 0 products"
+        direct_error = f"Direct: {json.dumps(debug_info)}"
 
     # 5. Fallback to mock data
     if use_mock:
@@ -762,7 +786,7 @@ def product_detail():
         if data.get('title'):
             save_product_cache(product_url, data)
             return jsonify({"success": True, "source": "scrapingbee", "product": data})
-        scrapingbee_error = f"ScrapingBee returned {len(html)} chars but parser found no title"
+        scrapingbee_error = f"ScrapingBee returned {len(html)} chars but no title found"
 
     # 3. Try Oxylabs (Fallback)
     html, oxylabs_error = fetch_oxylabs(product_url, timeout=90)
@@ -771,7 +795,7 @@ def product_detail():
         if data.get('title'):
             save_product_cache(product_url, data)
             return jsonify({"success": True, "source": "oxylabs", "product": data})
-        oxylabs_error = f"Oxylabs returned {len(html)} chars but parser found no title"
+        oxylabs_error = f"Oxylabs returned {len(html)} chars but no title found"
 
     # 4. Try direct scraping
     html, direct_error = fetch_direct(product_url, timeout=30)
@@ -780,7 +804,7 @@ def product_detail():
         if data.get('title'):
             save_product_cache(product_url, data)
             return jsonify({"success": True, "source": "direct", "product": data})
-        direct_error = f"Direct returned {len(html)} chars but parser found no title"
+        direct_error = f"Direct returned {len(html)} chars but no title found"
 
     # 5. Fallback to mock data
     if use_mock:
@@ -804,29 +828,42 @@ def product_detail():
 
 @app.route('/debug')
 def debug_fetch():
-    """Debug endpoint to see raw HTML structure."""
+    """Debug endpoint to inspect HTML structure and find window variables."""
     url = request.args.get('url', '').strip()
     if not url:
         return jsonify({"error": "Missing 'url' parameter"}), 400
 
-    results = {}
-
-    # ScrapingBee
     html, err = fetch_scrapingbee(url, timeout=60)
-    if html:
-        json_data = extract_json_from_scripts(html)
-        products = parse_search_results(html)
-        results['scrapingbee'] = {
-            "error": err,
-            "html_length": len(html),
-            "json_objects_found": len(json_data),
-            "products_parsed": len(products),
-            "html_preview": html[:1500]
-        }
-    else:
-        results['scrapingbee'] = {"error": err}
+    if not html:
+        return jsonify({"error": err or "Failed to fetch"}), 502
 
-    return jsonify({"success": True, "url": url, "results": results})
+    # Extract all window variables
+    window_vars = extract_all_window_vars(html)
+
+    # For each variable, check if it contains products
+    var_analysis = {}
+    for var_name, data in window_vars.items():
+        products = find_products_in_data(data)
+        var_analysis[var_name] = {
+            "type": type(data).__name__,
+            "has_products": len(products) > 0,
+            "product_count": len(products),
+            "data_preview": str(data)[:200] if not isinstance(data, (dict, list)) else json.dumps(data)[:200]
+        }
+
+    # Try parsing
+    products, debug_info = parse_search_results(html)
+
+    return jsonify({
+        "success": True,
+        "url": url,
+        "html_length": len(html),
+        "window_vars_found": list(window_vars.keys()),
+        "var_analysis": var_analysis,
+        "parse_debug": debug_info,
+        "products_found": len(products),
+        "html_preview": html[:1500]
+    })
 
 @app.route('/stats')
 def stats():
