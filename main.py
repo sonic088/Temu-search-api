@@ -12,7 +12,6 @@ from threading import Lock
 
 app = Flask(__name__)
 
-# Oxylabs Web Scraper API credentials
 OXYLABS_USER = os.environ.get('OXYLABS_USER', '')
 OXYLABS_PASS = os.environ.get('OXYLABS_PASS', '')
 OXYLABS_API_URL = "https://realtime.oxylabs.io/v1/queries"
@@ -65,9 +64,7 @@ def is_fresh(created_at_str):
 def get_cached_search(query):
     query_hash = hash_text(query.lower().strip())
     conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM search_cache WHERE query_hash = ?", (query_hash,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM search_cache WHERE query_hash = ?", (query_hash,)).fetchone()
     conn.close()
     if row and is_fresh(row['created_at']):
         return json.loads(row['results'])
@@ -80,8 +77,7 @@ def save_search_cache(query, results):
         INSERT INTO search_cache (query_hash, query, results)
         VALUES (?, ?, ?)
         ON CONFLICT(query_hash) DO UPDATE SET
-            results=excluded.results,
-            created_at=CURRENT_TIMESTAMP
+            results=excluded.results, created_at=CURRENT_TIMESTAMP
     """, (query_hash, query, json.dumps(results)))
     conn.commit()
     conn.close()
@@ -89,9 +85,7 @@ def save_search_cache(query, results):
 def get_cached_product(url):
     url_hash = hash_text(url)
     conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM product_cache WHERE url_hash = ?", (url_hash,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM product_cache WHERE url_hash = ?", (url_hash,)).fetchone()
     conn.close()
     if row and is_fresh(row['created_at']):
         return json.loads(row['product_data'])
@@ -104,39 +98,64 @@ def save_product_cache(url, data):
         INSERT INTO product_cache (url_hash, url, product_data)
         VALUES (?, ?, ?)
         ON CONFLICT(url_hash) DO UPDATE SET
-            product_data=excluded.product_data,
-            created_at=CURRENT_TIMESTAMP
+            product_data=excluded.product_data, created_at=CURRENT_TIMESTAMP
     """, (url_hash, url, json.dumps(data)))
     conn.commit()
     conn.close()
 
 def fetch_oxylabs(target_url, timeout=60):
-    payload = {
-        "url": target_url,
-        "source": "universal",
-        "render": "html",
-        "geo_location": "United States",
-    }
-    try:
-        resp = requests.post(
-            OXYLABS_API_URL,
-            auth=(OXYLABS_USER, OXYLABS_PASS),
-            json=payload,
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", [])
-        if results and len(results) > 0:
-            content = results[0].get("content", "")
-            if content:
-                return content
-        if "content" in data:
-            return data["content"]
-        return None
-    except Exception as e:
-        print(f"[Oxylabs Error] {e}")
-        return None
+    """Fetch URL through Oxylabs Web Scraper API with multiple fallback sources."""
+
+    sources_to_try = [
+        {"source": "universal", "render": "html", "geo_location": "United States"},
+        {"source": "universal", "render": "html"},
+        {"source": "google", "render": "html"},
+    ]
+
+    last_error = ""
+
+    for src_config in sources_to_try:
+        payload = {"url": target_url}
+        payload.update(src_config)
+
+        try:
+            resp = requests.post(
+                OXYLABS_API_URL,
+                auth=(OXYLABS_USER, OXYLABS_PASS),
+                json=payload,
+                timeout=timeout,
+            )
+
+            status = resp.status_code
+            if status == 200:
+                data = resp.json()
+                results = data.get("results", [])
+                if results and len(results) > 0:
+                    content = results[0].get("content", "")
+                    if content:
+                        return content
+                if "content" in data:
+                    return data["content"]
+                return None
+            else:
+                try:
+                    err_data = resp.json()
+                    last_error = f"HTTP {status}: {json.dumps(err_data)[:300]}"
+                except:
+                    last_error = f"HTTP {status}: {resp.text[:300]}"
+                print(f"[Oxylabs] Source {src_config['source']} failed: {last_error}")
+                continue
+
+        except requests.exceptions.Timeout:
+            last_error = "Timeout"
+            print(f"[Oxylabs] Source {src_config['source']} timeout")
+            continue
+        except Exception as e:
+            last_error = str(e)[:300]
+            print(f"[Oxylabs] Source {src_config['source']} error: {last_error}")
+            continue
+
+    return None, last_error
 
 def parse_search_results(html):
     soup = BeautifulSoup(html, 'lxml')
@@ -197,11 +216,9 @@ def parse_search_results(html):
 def parse_product_detail(html, product_url):
     soup = BeautifulSoup(html, 'lxml')
     data = {
-        'product_url': product_url,
-        'title': None, 'price': None, 'original_price': None,
-        'currency': None, 'rating': None, 'review_count': None,
-        'sold_count': None, 'description': None,
-        'images': [], 'colors': [], 'sizes': [],
+        'product_url': product_url, 'title': None, 'price': None, 'original_price': None,
+        'currency': None, 'rating': None, 'review_count': None, 'sold_count': None,
+        'description': None, 'images': [], 'colors': [], 'sizes': [],
         'specs': {}, 'store_info': {}, 'variants': [],
     }
     for sel in ['h1[data-testid="product-title"]', 'h1[class*="title"]', 'h1', 
@@ -213,8 +230,7 @@ def parse_product_detail(html, product_url):
     for sel in ['span[class*="price"]', 'div[class*="price"]', 'span[class*="_2de9"]', '[class*="current-price"]']:
         tag = soup.select_one(sel)
         if tag:
-            text = tag.get_text(strip=True)
-            data['price'] = text
+            data['price'] = tag.get_text(strip=True)
             break
     orig_tag = soup.select_one('[class*="original-price"]') or soup.select_one('[class*="market-price"]')
     if orig_tag:
@@ -296,10 +312,8 @@ def parse_product_detail(html, product_url):
                         if 'skuList' in goods:
                             for sku in goods['skuList']:
                                 variant = {
-                                    'sku_id': sku.get('skuId'),
-                                    'price': sku.get('price'),
-                                    'original_price': sku.get('marketPrice'),
-                                    'available': sku.get('isOnsale'),
+                                    'sku_id': sku.get('skuId'), 'price': sku.get('price'),
+                                    'original_price': sku.get('marketPrice'), 'available': sku.get('isOnsale'),
                                 }
                                 for spec in sku.get('specs', []):
                                     spec_name = spec.get('specName', '').lower()
@@ -341,30 +355,29 @@ def search_products():
     limit = min(int(request.args.get('limit', 12)), 24)
     if not query:
         return jsonify({"error": "Missing 'q' parameter"}), 400
+
     cached = get_cached_search(query)
     if cached:
         products = cached[:limit]
-        return jsonify({
-            "success": True,
-            "source": "cache",
-            "query": query,
-            "count": len(products),
-            "products": products
-        })
+        return jsonify({"success": True, "source": "cache", "query": query, "count": len(products), "products": products})
+
     search_url = f"https://www.temu.com/search_result.html?search_key={quote(query)}"
-    html = fetch_oxylabs(search_url, timeout=60)
+    result = fetch_oxylabs(search_url, timeout=60)
+
+    if isinstance(result, tuple):
+        html, error_msg = result
+        if html is None:
+            return jsonify({"error": f"Oxylabs failed: {error_msg}"}), 502
+    else:
+        html = result
+
     if not html:
-        return jsonify({"error": "Failed to fetch search results. Check Oxylabs credentials or API limit."}), 502
+        return jsonify({"error": "Oxylabs returned empty content"}), 502
+
     products = parse_search_results(html)[:limit]
     if products:
         save_search_cache(query, products)
-    return jsonify({
-        "success": True,
-        "source": "oxylabs",
-        "query": query,
-        "count": len(products),
-        "products": products
-    })
+    return jsonify({"success": True, "source": "oxylabs", "query": query, "count": len(products), "products": products})
 
 @app.route('/product', methods=['GET', 'POST'])
 def product_detail():
@@ -379,23 +392,25 @@ def product_detail():
         product_url = 'https://www.temu.com' + product_url
     if 'temu.com' not in product_url:
         return jsonify({"error": "Invalid Temu URL"}), 400
+
     cached = get_cached_product(product_url)
     if cached:
-        return jsonify({
-            "success": True,
-            "source": "cache",
-            "product": cached
-        })
-    html = fetch_oxylabs(product_url, timeout=90)
+        return jsonify({"success": True, "source": "cache", "product": cached})
+
+    result = fetch_oxylabs(product_url, timeout=90)
+    if isinstance(result, tuple):
+        html, error_msg = result
+        if html is None:
+            return jsonify({"error": f"Oxylabs failed: {error_msg}"}), 502
+    else:
+        html = result
+
     if not html:
-        return jsonify({"error": "Failed to fetch product page. Check Oxylabs credentials or API limit."}), 502
+        return jsonify({"error": "Oxylabs returned empty content"}), 502
+
     data = parse_product_detail(html, product_url)
     save_product_cache(product_url, data)
-    return jsonify({
-        "success": True,
-        "source": "oxylabs",
-        "product": data
-    })
+    return jsonify({"success": True, "source": "oxylabs", "product": data})
 
 @app.route('/stats')
 def stats():
@@ -407,16 +422,13 @@ def stats():
         "cached_searches": search_count,
         "cached_products": product_count,
         "cache_duration_days": CACHE_DAYS,
-        "oxylabs_configured": bool(OXYLABS_USER and OXYLABS_PASS)
+        "oxylabs_configured": bool(OXYLABS_USER and OXYLABS_PASS),
+        "oxylabs_user_prefix": OXYLABS_USER[:5] + "..." if OXYLABS_USER else None
     })
 
 @app.route('/health')
 def health():
-    return jsonify({
-        "status": "ok",
-        "oxylabs_configured": bool(OXYLABS_USER and OXYLABS_PASS),
-        "database_path": DB_PATH
-    })
+    return jsonify({"status": "ok", "oxylabs_configured": bool(OXYLABS_USER and OXYLABS_PASS)})
 
 init_db()
 
