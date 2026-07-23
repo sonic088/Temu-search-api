@@ -5,7 +5,6 @@ import re
 import json
 import sqlite3
 import hashlib
-import base64
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from urllib.parse import quote
@@ -13,15 +12,22 @@ from threading import Lock
 
 app = Flask(__name__)
 
+# ===================== CONFIG =====================
+# ScrapingBee (Primary)
+SCRAPINGBEE_API_KEY = os.environ.get('SCRAPINGBEE_API_KEY', '')
+
+# Oxylabs (Fallback)
 OXYLABS_USER = os.environ.get('OXYLABS_USER', '')
 OXYLABS_PASS = os.environ.get('OXYLABS_PASS', '')
 OXYLABS_API_URL = "https://realtime.oxylabs.io/v1/queries"
 
+# Cache
 DB_PATH = os.environ.get('DB_PATH', '/tmp/temu_cache.db')
 CACHE_DAYS = int(os.environ.get('CACHE_DAYS', 7))
 
 db_lock = Lock()
 
+# ===================== DATABASE =====================
 def init_db():
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
@@ -96,8 +102,33 @@ def save_product_cache(url, data):
     conn.commit()
     conn.close()
 
+# ===================== FETCHERS =====================
+
+def fetch_scrapingbee(target_url, timeout=60):
+    """Primary fetcher using ScrapingBee API (GET)."""
+    if not SCRAPINGBEE_API_KEY:
+        return None, "ScrapingBee API key not configured"
+
+    api_url = "https://app.scrapingbee.com/api/v1/"
+    params = {
+        "api_key": SCRAPINGBEE_API_KEY,
+        "url": target_url,
+        "render_js": "true",
+        "premium_proxy": "true",
+        "country_code": "us",
+    }
+
+    try:
+        resp = requests.get(api_url, params=params, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.text, None
+        else:
+            return None, f"ScrapingBee HTTP {resp.status_code}: {resp.text[:300]}"
+    except Exception as e:
+        return None, f"ScrapingBee error: {str(e)[:300]}"
+
 def fetch_oxylabs(target_url, timeout=60):
-    """Try Oxylabs API first."""
+    """Fallback fetcher using Oxylabs API (POST)."""
     if not OXYLABS_USER or not OXYLABS_PASS:
         return None, "Oxylabs credentials not configured"
 
@@ -128,14 +159,14 @@ def fetch_oxylabs(target_url, timeout=60):
         else:
             try:
                 err = resp.json()
-                return None, f"HTTP {resp.status_code}: {json.dumps(err)[:300]}"
+                return None, f"Oxylabs HTTP {resp.status_code}: {json.dumps(err)[:300]}"
             except:
-                return None, f"HTTP {resp.status_code}: {resp.text[:300]}"
+                return None, f"Oxylabs HTTP {resp.status_code}: {resp.text[:300]}"
     except Exception as e:
-        return None, str(e)[:300]
+        return None, f"Oxylabs error: {str(e)[:300]}"
 
 def fetch_direct(target_url, timeout=30):
-    """Try direct fetch without proxy."""
+    """Last resort direct fetch (likely blocked by Cloudflare)."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -148,8 +179,9 @@ def fetch_direct(target_url, timeout=30):
     except Exception as e:
         return None, str(e)[:300]
 
+# ===================== MOCK DATA =====================
+
 def get_mock_search_results(query):
-    """Return mock data for testing when all fetch methods fail."""
     return [
         {
             "product_id": "601099518075471",
@@ -187,7 +219,6 @@ def get_mock_search_results(query):
     ]
 
 def get_mock_product_detail(product_url):
-    """Return mock product details for testing."""
     return {
         "product_url": product_url,
         "title": "Mock Wireless Earbuds Bluetooth 5.3",
@@ -219,9 +250,13 @@ def get_mock_product_detail(product_url):
         ]
     }
 
+# ===================== PARSERS =====================
+
 def parse_search_results(html):
-    soup = BeautifulSoup(html, 'lxml')
+    soup = BeautifulSoup(html, 'html.parser')
     products = []
+
+    # Try multiple selectors for Temu search results
     cards = (
         soup.select('div[data-testid="product-card"]') or
         soup.select('div[class*="goods-item"]') or
@@ -229,6 +264,7 @@ def parse_search_results(html):
         soup.select('a[href*="goods.html"]') or
         soup.find_all('div', class_=re.compile(r'.*goods.*'))
     )
+
     for card in cards[:24]:
         product = {}
         link_tag = card if card.name == 'a' else card.find('a', href=re.compile(r'goods_id'))
@@ -240,63 +276,78 @@ def parse_search_results(html):
             match = re.search(r'goods_id[=:](\d+)', href)
             if match:
                 product['product_id'] = match.group(1)
+
         title_tag = (card.select_one('[class*="title"]') or card.select_one('h2') or 
                      card.select_one('h3') or card.select_one('span[class*="title"]'))
         if title_tag:
             product['title'] = title_tag.get_text(strip=True)
+
         price_tag = (card.select_one('[class*="price"]') or card.select_one('span[class*="_2de9"]') or
                      card.find(text=re.compile(r'\$\d+')))
         if price_tag:
             text = price_tag.get_text(strip=True) if hasattr(price_tag, 'get_text') else price_tag.strip()
             product['price'] = text
+
         orig_tag = card.select_one('[class*="original"]') or card.select_one('[class*="market"]')
         if orig_tag:
             product['original_price'] = orig_tag.get_text(strip=True)
+
         rating_tag = card.select_one('[class*="rating"]') or card.find(text=re.compile(r'\d\.\d'))
         if rating_tag:
             text = rating_tag.get_text(strip=True) if hasattr(rating_tag, 'get_text') else rating_tag
             match = re.search(r'(\d\.\d)', text)
             if match:
                 product['rating'] = float(match.group(1))
+
         sold_tag = card.select_one('[class*="sold"]') or card.find(text=re.compile(r'\d+[KkMm]?\+?\s*sold'))
         if sold_tag:
             text = sold_tag.get_text(strip=True) if hasattr(sold_tag, 'get_text') else sold_tag
             product['sold_count'] = text.strip()
+
         img_tag = card.select_one('img[src*="kwcdn.com"]') or card.select_one('img[data-src*="kwcdn.com"]')
         if img_tag:
             product['image'] = img_tag.get('src') or img_tag.get('data-src')
+
         discount_tag = card.select_one('[class*="discount"]') or card.find(text=re.compile(r'-?\d+%'))
         if discount_tag:
             text = discount_tag.get_text(strip=True) if hasattr(discount_tag, 'get_text') else discount_tag
             match = re.search(r'(\d+)%', text)
             if match:
                 product['discount_percent'] = int(match.group(1))
+
         if product.get('title') or product.get('product_id'):
             products.append(product)
+
     return products
 
 def parse_product_detail(html, product_url):
-    soup = BeautifulSoup(html, 'lxml')
+    soup = BeautifulSoup(html, 'html.parser')
     data = {
         'product_url': product_url, 'title': None, 'price': None, 'original_price': None,
         'currency': None, 'rating': None, 'review_count': None, 'sold_count': None,
         'description': None, 'images': [], 'colors': [], 'sizes': [],
         'specs': {}, 'store_info': {}, 'variants': [],
     }
+
+    # Title
     for sel in ['h1[data-testid="product-title"]', 'h1[class*="title"]', 'h1', 
                 'div[class*="product-name"] h1', 'span[class*="product-title"]']:
         tag = soup.select_one(sel)
         if tag:
             data['title'] = tag.get_text(strip=True)
             break
+
+    # Price
     for sel in ['span[class*="price"]', 'div[class*="price"]', 'span[class*="_2de9"]', '[class*="current-price"]']:
         tag = soup.select_one(sel)
         if tag:
             data['price'] = tag.get_text(strip=True)
             break
+
     orig_tag = soup.select_one('[class*="original-price"]') or soup.select_one('[class*="market-price"]')
     if orig_tag:
         data['original_price'] = orig_tag.get_text(strip=True)
+
     rating_tag = soup.find(text=re.compile(r'\d\.\d'))
     if rating_tag:
         parent = rating_tag.parent
@@ -304,14 +355,18 @@ def parse_product_detail(html, product_url):
             match = re.search(r'(\d\.\d)', parent.get_text())
             if match:
                 data['rating'] = float(match.group(1))
+
     review_tag = soup.find(text=re.compile(r'\d+\s*reviews?', re.I))
     if review_tag:
         match = re.search(r'(\d+)', review_tag)
         if match:
             data['review_count'] = int(match.group(1))
+
     sold_tag = soup.find(text=re.compile(r'\d+[KkMm]?\+?\s*sold', re.I))
     if sold_tag:
         data['sold_count'] = sold_tag.strip()
+
+    # Images
     img_tags = soup.select('img[src*="kwcdn.com"]') + soup.select('img[data-src*="kwcdn.com"]')
     seen = set()
     for img in img_tags:
@@ -319,6 +374,8 @@ def parse_product_detail(html, product_url):
         if src and src not in seen and 'thumbnail' not in src.lower():
             seen.add(src)
             data['images'].append(src)
+
+    # Colors
     for tag in soup.select('[class*="color"]') + soup.select('[class*="colour"]'):
         text = tag.get_text(strip=True)
         if text and len(text) < 50 and text not in data['colors']:
@@ -327,13 +384,19 @@ def parse_product_detail(html, product_url):
         text = swatch.get_text(strip=True)
         if text and text not in data['colors'] and len(text) < 50:
             data['colors'].append(text)
+
+    # Sizes
     for tag in soup.select('[class*="size"]') + soup.select('[class*="dimension"]'):
         text = tag.get_text(strip=True)
         if text and text not in data['sizes'] and len(text) < 30:
             data['sizes'].append(text)
+
+    # Description
     desc_tag = soup.select_one('[class*="description"]') or soup.select_one('[class*="detail"]')
     if desc_tag:
         data['description'] = desc_tag.get_text(strip=True)[:500]
+
+    # Specs
     for row in soup.select('[class*="spec"]') + soup.select('table tr'):
         cells = row.select('td, th, div')
         if len(cells) >= 2:
@@ -341,9 +404,13 @@ def parse_product_detail(html, product_url):
             val = cells[1].get_text(strip=True)
             if key and val and len(key) < 50:
                 data['specs'][key] = val
+
+    # Store info
     store_tag = soup.select_one('[class*="store"]') or soup.select_one('[class*="mall"]')
     if store_tag:
         data['store_info']['name'] = store_tag.get_text(strip=True)
+
+    # JSON-LD
     for script in soup.find_all('script', type='application/ld+json'):
         try:
             ld = json.loads(script.string)
@@ -361,6 +428,8 @@ def parse_product_detail(html, product_url):
                             data['images'].append(img)
         except:
             pass
+
+    # Initial state
     for script in soup.find_all('script'):
         if script.string and ('initialState' in script.string or 'goodsInfo' in script.string):
             try:
@@ -391,16 +460,19 @@ def parse_product_detail(html, product_url):
                                 data['variants'].append(variant)
             except:
                 pass
+
     data['colors'] = list(dict.fromkeys(data['colors']))[:20]
     data['sizes'] = list(dict.fromkeys(data['sizes']))[:20]
     data['images'] = data['images'][:15]
     return data
 
+# ===================== ROUTES =====================
+
 @app.route('/')
 def home():
     return jsonify({
         "service": "Temu Scraper API with Cache",
-        "powered_by": "Oxylabs Web Scraper API + Fallback",
+        "powered_by": "ScrapingBee (Primary) + Oxylabs (Fallback) + Direct + Mock",
         "database": "SQLite (cached for " + str(CACHE_DAYS) + " days)",
         "endpoints": {
             "GET /search?q=<keyword>&limit=<n>": "Search products (cached)",
@@ -426,26 +498,33 @@ def search_products():
         products = cached[:limit]
         return jsonify({"success": True, "source": "cache", "query": query, "count": len(products), "products": products})
 
-    # 2. Try Oxylabs
     search_url = f"https://www.temu.com/search_result.html?search_key={quote(query)}"
-    html, oxylabs_error = fetch_oxylabs(search_url, timeout=60)
 
+    # 2. Try ScrapingBee (Primary)
+    html, scrapingbee_error = fetch_scrapingbee(search_url, timeout=60)
+    if html:
+        products = parse_search_results(html)[:limit]
+        if products:
+            save_search_cache(query, products)
+            return jsonify({"success": True, "source": "scrapingbee", "query": query, "count": len(products), "products": products})
+
+    # 3. Try Oxylabs (Fallback)
+    html, oxylabs_error = fetch_oxylabs(search_url, timeout=60)
     if html:
         products = parse_search_results(html)[:limit]
         if products:
             save_search_cache(query, products)
             return jsonify({"success": True, "source": "oxylabs", "query": query, "count": len(products), "products": products})
 
-    # 3. Try direct scraping
+    # 4. Try direct scraping
     html, direct_error = fetch_direct(search_url, timeout=30)
-
     if html:
         products = parse_search_results(html)[:limit]
         if products:
             save_search_cache(query, products)
             return jsonify({"success": True, "source": "direct", "query": query, "count": len(products), "products": products})
 
-    # 4. Fallback to mock data
+    # 5. Fallback to mock data
     if use_mock:
         products = get_mock_search_results(query)[:limit]
         return jsonify({
@@ -454,12 +533,14 @@ def search_products():
             "query": query,
             "count": len(products),
             "products": products,
+            "scrapingbee_error": scrapingbee_error,
             "oxylabs_error": oxylabs_error,
             "direct_error": direct_error
         })
 
     return jsonify({
         "error": "All fetch methods failed",
+        "scrapingbee_error": scrapingbee_error,
         "oxylabs_error": oxylabs_error,
         "direct_error": direct_error,
         "note": "Add ?mock=true to get test data"
@@ -486,35 +567,42 @@ def product_detail():
     if cached:
         return jsonify({"success": True, "source": "cache", "product": cached})
 
-    # 2. Try Oxylabs
-    html, oxylabs_error = fetch_oxylabs(product_url, timeout=90)
+    # 2. Try ScrapingBee (Primary)
+    html, scrapingbee_error = fetch_scrapingbee(product_url, timeout=90)
+    if html:
+        data = parse_product_detail(html, product_url)
+        save_product_cache(product_url, data)
+        return jsonify({"success": True, "source": "scrapingbee", "product": data})
 
+    # 3. Try Oxylabs (Fallback)
+    html, oxylabs_error = fetch_oxylabs(product_url, timeout=90)
     if html:
         data = parse_product_detail(html, product_url)
         save_product_cache(product_url, data)
         return jsonify({"success": True, "source": "oxylabs", "product": data})
 
-    # 3. Try direct scraping
+    # 4. Try direct scraping
     html, direct_error = fetch_direct(product_url, timeout=30)
-
     if html:
         data = parse_product_detail(html, product_url)
         save_product_cache(product_url, data)
         return jsonify({"success": True, "source": "direct", "product": data})
 
-    # 4. Fallback to mock data
+    # 5. Fallback to mock data
     if use_mock:
         data = get_mock_product_detail(product_url)
         return jsonify({
             "success": True,
             "source": "mock",
             "product": data,
+            "scrapingbee_error": scrapingbee_error,
             "oxylabs_error": oxylabs_error,
             "direct_error": direct_error
         })
 
     return jsonify({
         "error": "All fetch methods failed",
+        "scrapingbee_error": scrapingbee_error,
         "oxylabs_error": oxylabs_error,
         "direct_error": direct_error,
         "note": "Add ?mock=true to get test data"
@@ -530,16 +618,17 @@ def stats():
         "cached_searches": search_count,
         "cached_products": product_count,
         "cache_duration_days": CACHE_DAYS,
+        "scrapingbee_configured": bool(SCRAPINGBEE_API_KEY),
         "oxylabs_configured": bool(OXYLABS_USER and OXYLABS_PASS),
         "oxylabs_user_prefix": OXYLABS_USER[:5] + "..." if OXYLABS_USER else None
     })
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "oxylabs_configured": bool(OXYLABS_USER and OXYLABS_PASS)})
+    return jsonify({
+        "status": "ok",
+        "scrapingbee_configured": bool(SCRAPINGBEE_API_KEY),
+        "oxylabs_configured": bool(OXYLABS_USER and OXYLABS_PASS)
+    })
 
 init_db()
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
