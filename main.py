@@ -13,15 +13,10 @@ from threading import Lock
 app = Flask(__name__)
 
 # ===================== CONFIG =====================
-# ScrapingBee (Primary)
 SCRAPINGBEE_API_KEY = os.environ.get('SCRAPINGBEE_API_KEY', '')
-
-# Oxylabs (Fallback)
 OXYLABS_USER = os.environ.get('OXYLABS_USER', '')
 OXYLABS_PASS = os.environ.get('OXYLABS_PASS', '')
 OXYLABS_API_URL = "https://realtime.oxylabs.io/v1/queries"
-
-# Cache
 DB_PATH = os.environ.get('DB_PATH', '/tmp/temu_cache.db')
 CACHE_DAYS = int(os.environ.get('CACHE_DAYS', 7))
 
@@ -105,7 +100,6 @@ def save_product_cache(url, data):
 # ===================== FETCHERS =====================
 
 def fetch_scrapingbee(target_url, timeout=60):
-    """Primary fetcher using ScrapingBee API (GET)."""
     if not SCRAPINGBEE_API_KEY:
         return None, "ScrapingBee API key not configured"
 
@@ -116,19 +110,22 @@ def fetch_scrapingbee(target_url, timeout=60):
         "render_js": "true",
         "premium_proxy": "true",
         "country_code": "us",
+        "wait": "5000",  # Wait 5 seconds for JS to render
     }
 
     try:
         resp = requests.get(api_url, params=params, timeout=timeout)
         if resp.status_code == 200:
-            return resp.text, None
+            html = resp.text
+            if len(html) < 1000:
+                return None, f"ScrapingBee returned too short HTML ({len(html)} chars). First 200: {html[:200]}"
+            return html, None
         else:
             return None, f"ScrapingBee HTTP {resp.status_code}: {resp.text[:300]}"
     except Exception as e:
         return None, f"ScrapingBee error: {str(e)[:300]}"
 
 def fetch_oxylabs(target_url, timeout=60):
-    """Fallback fetcher using Oxylabs API (POST)."""
     if not OXYLABS_USER or not OXYLABS_PASS:
         return None, "Oxylabs credentials not configured"
 
@@ -166,7 +163,6 @@ def fetch_oxylabs(target_url, timeout=60):
         return None, f"Oxylabs error: {str(e)[:300]}"
 
 def fetch_direct(target_url, timeout=30):
-    """Last resort direct fetch (likely blocked by Cloudflare)."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -256,6 +252,11 @@ def parse_search_results(html):
     soup = BeautifulSoup(html, 'html.parser')
     products = []
 
+    # Debug: log HTML structure clues
+    title_tags = soup.find_all(['h1', 'h2', 'h3', 'h4'])
+    div_count = len(soup.find_all('div'))
+    script_count = len(soup.find_all('script'))
+
     # Try multiple selectors for Temu search results
     cards = (
         soup.select('div[data-testid="product-card"]') or
@@ -318,7 +319,17 @@ def parse_search_results(html):
         if product.get('title') or product.get('product_id'):
             products.append(product)
 
-    return products
+    debug_info = {
+        "html_length": len(html),
+        "div_count": div_count,
+        "script_count": script_count,
+        "title_tags_found": len(title_tags),
+        "cards_found": len(cards),
+        "products_parsed": len(products),
+        "first_title": title_tags[0].get_text(strip=True)[:100] if title_tags else None
+    }
+
+    return products, debug_info
 
 def parse_product_detail(html, product_url):
     soup = BeautifulSoup(html, 'html.parser')
@@ -329,7 +340,6 @@ def parse_product_detail(html, product_url):
         'specs': {}, 'store_info': {}, 'variants': [],
     }
 
-    # Title
     for sel in ['h1[data-testid="product-title"]', 'h1[class*="title"]', 'h1', 
                 'div[class*="product-name"] h1', 'span[class*="product-title"]']:
         tag = soup.select_one(sel)
@@ -337,7 +347,6 @@ def parse_product_detail(html, product_url):
             data['title'] = tag.get_text(strip=True)
             break
 
-    # Price
     for sel in ['span[class*="price"]', 'div[class*="price"]', 'span[class*="_2de9"]', '[class*="current-price"]']:
         tag = soup.select_one(sel)
         if tag:
@@ -366,7 +375,6 @@ def parse_product_detail(html, product_url):
     if sold_tag:
         data['sold_count'] = sold_tag.strip()
 
-    # Images
     img_tags = soup.select('img[src*="kwcdn.com"]') + soup.select('img[data-src*="kwcdn.com"]')
     seen = set()
     for img in img_tags:
@@ -375,7 +383,6 @@ def parse_product_detail(html, product_url):
             seen.add(src)
             data['images'].append(src)
 
-    # Colors
     for tag in soup.select('[class*="color"]') + soup.select('[class*="colour"]'):
         text = tag.get_text(strip=True)
         if text and len(text) < 50 and text not in data['colors']:
@@ -385,18 +392,15 @@ def parse_product_detail(html, product_url):
         if text and text not in data['colors'] and len(text) < 50:
             data['colors'].append(text)
 
-    # Sizes
     for tag in soup.select('[class*="size"]') + soup.select('[class*="dimension"]'):
         text = tag.get_text(strip=True)
         if text and text not in data['sizes'] and len(text) < 30:
             data['sizes'].append(text)
 
-    # Description
     desc_tag = soup.select_one('[class*="description"]') or soup.select_one('[class*="detail"]')
     if desc_tag:
         data['description'] = desc_tag.get_text(strip=True)[:500]
 
-    # Specs
     for row in soup.select('[class*="spec"]') + soup.select('table tr'):
         cells = row.select('td, th, div')
         if len(cells) >= 2:
@@ -405,12 +409,10 @@ def parse_product_detail(html, product_url):
             if key and val and len(key) < 50:
                 data['specs'][key] = val
 
-    # Store info
     store_tag = soup.select_one('[class*="store"]') or soup.select_one('[class*="mall"]')
     if store_tag:
         data['store_info']['name'] = store_tag.get_text(strip=True)
 
-    # JSON-LD
     for script in soup.find_all('script', type='application/ld+json'):
         try:
             ld = json.loads(script.string)
@@ -429,7 +431,6 @@ def parse_product_detail(html, product_url):
         except:
             pass
 
-    # Initial state
     for script in soup.find_all('script'):
         if script.string and ('initialState' in script.string or 'goodsInfo' in script.string):
             try:
@@ -479,7 +480,8 @@ def home():
             "GET /product?url=<temu_url>": "Get product details (cached)",
             "POST /product": {"body": {"url": "temu product url"}},
             "GET /stats": "View cache statistics",
-            "GET /health": "Check API health"
+            "GET /health": "Check API health",
+            "GET /debug?url=<temu_url>": "Debug HTML fetch (no parsing)"
         }
     })
 
@@ -503,26 +505,29 @@ def search_products():
     # 2. Try ScrapingBee (Primary)
     html, scrapingbee_error = fetch_scrapingbee(search_url, timeout=60)
     if html:
-        products = parse_search_results(html)[:limit]
+        products, debug_info = parse_search_results(html)
         if products:
             save_search_cache(query, products)
             return jsonify({"success": True, "source": "scrapingbee", "query": query, "count": len(products), "products": products})
+        scrapingbee_error = f"ScrapingBee returned HTML but parser found 0 products. Debug: {json.dumps(debug_info)}"
 
     # 3. Try Oxylabs (Fallback)
     html, oxylabs_error = fetch_oxylabs(search_url, timeout=60)
     if html:
-        products = parse_search_results(html)[:limit]
+        products, debug_info = parse_search_results(html)
         if products:
             save_search_cache(query, products)
             return jsonify({"success": True, "source": "oxylabs", "query": query, "count": len(products), "products": products})
+        oxylabs_error = f"Oxylabs returned HTML but parser found 0 products. Debug: {json.dumps(debug_info)}"
 
     # 4. Try direct scraping
     html, direct_error = fetch_direct(search_url, timeout=30)
     if html:
-        products = parse_search_results(html)[:limit]
+        products, debug_info = parse_search_results(html)
         if products:
             save_search_cache(query, products)
             return jsonify({"success": True, "source": "direct", "query": query, "count": len(products), "products": products})
+        direct_error = f"Direct returned HTML but parser found 0 products. Debug: {json.dumps(debug_info)}"
 
     # 5. Fallback to mock data
     if use_mock:
@@ -571,22 +576,28 @@ def product_detail():
     html, scrapingbee_error = fetch_scrapingbee(product_url, timeout=90)
     if html:
         data = parse_product_detail(html, product_url)
-        save_product_cache(product_url, data)
-        return jsonify({"success": True, "source": "scrapingbee", "product": data})
+        if data.get('title'):
+            save_product_cache(product_url, data)
+            return jsonify({"success": True, "source": "scrapingbee", "product": data})
+        scrapingbee_error = "ScrapingBee returned HTML but parser found no title"
 
     # 3. Try Oxylabs (Fallback)
     html, oxylabs_error = fetch_oxylabs(product_url, timeout=90)
     if html:
         data = parse_product_detail(html, product_url)
-        save_product_cache(product_url, data)
-        return jsonify({"success": True, "source": "oxylabs", "product": data})
+        if data.get('title'):
+            save_product_cache(product_url, data)
+            return jsonify({"success": True, "source": "oxylabs", "product": data})
+        oxylabs_error = "Oxylabs returned HTML but parser found no title"
 
     # 4. Try direct scraping
     html, direct_error = fetch_direct(product_url, timeout=30)
     if html:
         data = parse_product_detail(html, product_url)
-        save_product_cache(product_url, data)
-        return jsonify({"success": True, "source": "direct", "product": data})
+        if data.get('title'):
+            save_product_cache(product_url, data)
+            return jsonify({"success": True, "source": "direct", "product": data})
+        direct_error = "Direct returned HTML but parser found no title"
 
     # 5. Fallback to mock data
     if use_mock:
@@ -607,6 +618,41 @@ def product_detail():
         "direct_error": direct_error,
         "note": "Add ?mock=true to get test data"
     }), 502
+
+@app.route('/debug')
+def debug_fetch():
+    """Debug endpoint to see raw HTML from each fetcher."""
+    url = request.args.get('url', '').strip()
+    if not url:
+        return jsonify({"error": "Missing 'url' parameter"}), 400
+
+    results = {}
+
+    # ScrapingBee
+    html, err = fetch_scrapingbee(url, timeout=60)
+    results['scrapingbee'] = {
+        "error": err,
+        "html_length": len(html) if html else 0,
+        "html_preview": html[:2000] if html else None
+    }
+
+    # Oxylabs
+    html, err = fetch_oxylabs(url, timeout=60)
+    results['oxylabs'] = {
+        "error": err,
+        "html_length": len(html) if html else 0,
+        "html_preview": html[:2000] if html else None
+    }
+
+    # Direct
+    html, err = fetch_direct(url, timeout=30)
+    results['direct'] = {
+        "error": err,
+        "html_length": len(html) if html else 0,
+        "html_preview": html[:2000] if html else None
+    }
+
+    return jsonify({"success": True, "url": url, "results": results})
 
 @app.route('/stats')
 def stats():
