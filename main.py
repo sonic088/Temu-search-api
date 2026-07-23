@@ -5,6 +5,7 @@ import re
 import json
 import sqlite3
 import hashlib
+import base64
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from urllib.parse import quote
@@ -14,7 +15,13 @@ app = Flask(__name__)
 
 OXYLABS_USER = os.environ.get('OXYLABS_USER', '')
 OXYLABS_PASS = os.environ.get('OXYLABS_PASS', '')
-OXYLABS_API_URL = "https://realtime.oxylabs.io/v1/queries"
+
+# Try multiple Oxylabs endpoints
+OXYLABS_ENDPOINTS = [
+    "https://realtime.oxylabs.io/v1/queries",
+    "https://scraper-api.oxylabs.io/v2/queries",
+    "https://realtime.oxylabs.io/v1/scrape",
+]
 
 DB_PATH = os.environ.get('DB_PATH', '/tmp/temu_cache.db')
 CACHE_DAYS = int(os.environ.get('CACHE_DAYS', 7))
@@ -28,20 +35,14 @@ def init_db():
         c.execute("""
             CREATE TABLE IF NOT EXISTS search_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                query_hash TEXT UNIQUE,
-                query TEXT,
-                results TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+                query_hash TEXT UNIQUE, query TEXT, results TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
         """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS product_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url_hash TEXT UNIQUE,
-                url TEXT,
-                product_data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+                url_hash TEXT UNIQUE, url TEXT, product_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
         """)
         conn.commit()
         conn.close()
@@ -75,9 +76,8 @@ def save_search_cache(query, results):
     conn = get_db()
     conn.execute("""
         INSERT INTO search_cache (query_hash, query, results)
-        VALUES (?, ?, ?)
-        ON CONFLICT(query_hash) DO UPDATE SET
-            results=excluded.results, created_at=CURRENT_TIMESTAMP
+        VALUES (?, ?, ?) ON CONFLICT(query_hash) DO UPDATE SET
+        results=excluded.results, created_at=CURRENT_TIMESTAMP
     """, (query_hash, query, json.dumps(results)))
     conn.commit()
     conn.close()
@@ -96,66 +96,66 @@ def save_product_cache(url, data):
     conn = get_db()
     conn.execute("""
         INSERT INTO product_cache (url_hash, url, product_data)
-        VALUES (?, ?, ?)
-        ON CONFLICT(url_hash) DO UPDATE SET
-            product_data=excluded.product_data, created_at=CURRENT_TIMESTAMP
+        VALUES (?, ?, ?) ON CONFLICT(url_hash) DO UPDATE SET
+        product_data=excluded.product_data, created_at=CURRENT_TIMESTAMP
     """, (url_hash, url, json.dumps(data)))
     conn.commit()
     conn.close()
 
 def fetch_oxylabs(target_url, timeout=60):
-    """Fetch URL through Oxylabs Web Scraper API with multiple fallback sources."""
+    """Fetch URL through Oxylabs with multiple endpoints and sources."""
+
+    # Build Basic Auth header manually to handle special chars like +
+    credentials = f"{OXYLABS_USER}:{OXYLABS_PASS}"
+    encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
+    headers = {
+        "Authorization": f"Basic {encoded_credentials}",
+        "Content-Type": "application/json"
+    }
 
     sources_to_try = [
         {"source": "universal", "render": "html", "geo_location": "United States"},
         {"source": "universal", "render": "html"},
         {"source": "google", "render": "html"},
+        {"source": "amazon", "render": "html"},
     ]
 
-    last_error = ""
+    all_errors = []
 
-    for src_config in sources_to_try:
-        payload = {"url": target_url}
-        payload.update(src_config)
+    for endpoint in OXYLABS_ENDPOINTS:
+        for src_config in sources_to_try:
+            payload = {"url": target_url}
+            payload.update(src_config)
 
-        try:
-            resp = requests.post(
-                OXYLABS_API_URL,
-                auth=(OXYLABS_USER, OXYLABS_PASS),
-                json=payload,
-                timeout=timeout,
-            )
+            try:
+                resp = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+                status = resp.status_code
 
-            status = resp.status_code
-            if status == 200:
-                data = resp.json()
-                results = data.get("results", [])
-                if results and len(results) > 0:
-                    content = results[0].get("content", "")
-                    if content:
-                        return content
-                if "content" in data:
-                    return data["content"]
-                return None
-            else:
-                try:
-                    err_data = resp.json()
-                    last_error = f"HTTP {status}: {json.dumps(err_data)[:300]}"
-                except:
-                    last_error = f"HTTP {status}: {resp.text[:300]}"
-                print(f"[Oxylabs] Source {src_config['source']} failed: {last_error}")
-                continue
+                if status == 200:
+                    data = resp.json()
+                    results = data.get("results", [])
+                    if results and len(results) > 0:
+                        content = results[0].get("content", "")
+                        if content:
+                            return content
+                    if "content" in data:
+                        return data["content"]
+                    return None
+                else:
+                    try:
+                        err = resp.json()
+                        err_msg = f"{endpoint} | {src_config['source']} | HTTP {status}: {json.dumps(err)[:200]}"
+                    except:
+                        err_msg = f"{endpoint} | {src_config['source']} | HTTP {status}: {resp.text[:200]}"
+                    all_errors.append(err_msg)
+                    print(f"[Oxylabs] {err_msg}")
 
-        except requests.exceptions.Timeout:
-            last_error = "Timeout"
-            print(f"[Oxylabs] Source {src_config['source']} timeout")
-            continue
-        except Exception as e:
-            last_error = str(e)[:300]
-            print(f"[Oxylabs] Source {src_config['source']} error: {last_error}")
-            continue
+            except requests.exceptions.Timeout:
+                all_errors.append(f"{endpoint} | {src_config['source']} | Timeout")
+            except Exception as e:
+                all_errors.append(f"{endpoint} | {src_config['source']} | {str(e)[:200]}")
 
-    return None, last_error
+    return None, " | ".join(all_errors[:3])
 
 def parse_search_results(html):
     soup = BeautifulSoup(html, 'lxml')
@@ -367,7 +367,7 @@ def search_products():
     if isinstance(result, tuple):
         html, error_msg = result
         if html is None:
-            return jsonify({"error": f"Oxylabs failed: {error_msg}"}), 502
+            return jsonify({"error": f"Oxylabs failed", "details": error_msg}), 502
     else:
         html = result
 
@@ -401,7 +401,7 @@ def product_detail():
     if isinstance(result, tuple):
         html, error_msg = result
         if html is None:
-            return jsonify({"error": f"Oxylabs failed: {error_msg}"}), 502
+            return jsonify({"error": f"Oxylabs failed", "details": error_msg}), 502
     else:
         html = result
 
