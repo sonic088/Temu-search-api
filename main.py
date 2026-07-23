@@ -1,13 +1,7 @@
-"""
-Temu Scraper API — Apify Primary Source (Multi-Image Edition)
-Repo: sonic088/Temu-search-api
-Deploy: Render (temu-search-apik.onrender.com)
-"""
-
 import os
 import sqlite3
 import json
-import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -22,11 +16,8 @@ APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
 CACHE_DAYS = int(os.getenv("CACHE_DAYS", "7"))
 DB_PATH = os.getenv("DB_PATH", "temu_cache.db")
 
-# Apify Actors
-ACTOR_SEARCH = "amit123/temu-products-scraper"      # يدعم searchQueries
-ACTOR_PRODUCT = "piotrv1001/temu-listings-scraper"    # يدعم startUrls (multi-image)
-
-app = FastAPI(title="Temu Scraper API", version="2.1.0")
+ACTOR_SEARCH = "amit123/temu-products-scraper"
+ACTOR_PRODUCT = "piotrv1001/temu-listings-scraper"
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
@@ -34,20 +25,20 @@ app = FastAPI(title="Temu Scraper API", version="2.1.0")
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''
+    c.execute("""
         CREATE TABLE IF NOT EXISTS search_cache (
             query TEXT PRIMARY KEY,
             data TEXT,
             created_at TIMESTAMP
         )
-    ''')
-    c.execute('''
+    """)
+    c.execute("""
         CREATE TABLE IF NOT EXISTS product_cache (
             url TEXT PRIMARY KEY,
             data TEXT,
             created_at TIMESTAMP
         )
-    ''')
+    """)
     conn.commit()
     conn.close()
 
@@ -82,10 +73,6 @@ def set_cache(table: str, key: str, data: Any):
 # APIFY CLIENT
 # ═══════════════════════════════════════════════════════════════
 def run_apify_sync(actor_id: str, run_input: dict, timeout: int = 120) -> Optional[List[dict]]:
-    """
-    يشغل Actor عبر Apify بشكل متزامن (run-sync-get-dataset-items)
-    ويعيد قائمة الـ items مباشرة.
-    """
     if not APIFY_API_TOKEN:
         print("[Apify] API token not configured")
         return None
@@ -113,7 +100,6 @@ def run_apify_sync(actor_id: str, run_input: dict, timeout: int = 120) -> Option
 # NORMALIZERS
 # ═══════════════════════════════════════════════════════════════
 def normalize_search(items: List[dict], image_map: Dict[str, List[str]] = None) -> List[dict]:
-    """يوحّد خرج amit123/temu-products-scraper إلى schema ثابت مع صور إضافية"""
     results = []
     image_map = image_map or {}
     for item in items:
@@ -121,7 +107,6 @@ def normalize_search(items: List[dict], image_map: Dict[str, List[str]] = None) 
         comment = item.get("comment", {}) or {}
         product_url = item.get("link_url", "")
 
-        # استخراج الخصم إن وُجد
         price_str = price_info.get("price_str", "")
         market_str = price_info.get("market_price_str", "")
         discount = None
@@ -133,7 +118,6 @@ def normalize_search(items: List[dict], image_map: Dict[str, List[str]] = None) 
         except:
             pass
 
-        # الصور الإضافية من الـ image_map (من piotrv1001)
         extra_images = image_map.get(product_url, [])
 
         results.append({
@@ -155,7 +139,6 @@ def normalize_search(items: List[dict], image_map: Dict[str, List[str]] = None) 
     return results
 
 def normalize_product(items: List[dict]) -> Optional[dict]:
-    """يوحّد خرج piotrv1001/temu-listings-scraper إلى schema ثابت"""
     if not items:
         return None
     item = items[0]
@@ -179,7 +162,6 @@ def normalize_product(items: List[dict]) -> Optional[dict]:
     }
 
 def extract_image_map(items: List[dict]) -> Dict[str, List[str]]:
-    """يبني mapping من productUrl → additionalImages من piotrv1001"""
     mapping = {}
     for item in items:
         url = item.get("productUrl", "")
@@ -189,7 +171,7 @@ def extract_image_map(items: List[dict]) -> Dict[str, List[str]]:
     return mapping
 
 # ═══════════════════════════════════════════════════════════════
-# MOCK DATA (Fallback)
+# MOCK DATA
 # ═══════════════════════════════════════════════════════════════
 MOCK_SEARCH = [
     {
@@ -269,17 +251,23 @@ MOCK_PRODUCT = {
 }
 
 # ═══════════════════════════════════════════════════════════════
+# LIFESPAN (FastAPI modern startup)
+# ═══════════════════════════════════════════════════════════════
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(title="Temu Scraper API", version="2.1.1", lifespan=lifespan)
+
+# ═══════════════════════════════════════════════════════════════
 # ENDPOINTS
 # ═══════════════════════════════════════════════════════════════
-@app.on_event("startup")
-async def startup_event():
-    init_db()
-
 @app.get("/")
 async def root():
     return {
         "service": "Temu Scraper API",
-        "version": "2.1.0",
+        "version": "2.1.1",
         "source": "Apify Primary (Multi-Image)",
         "endpoints": ["/search", "/product", "/stats"]
     }
@@ -294,7 +282,7 @@ async def search(
     if cached:
         return {"source": "cache", "count": len(cached), "results": cached}
 
-    # ── 1. Apify Search ──
+    # 1. Apify Search
     run_input = {
         "searchQueries": [q],
         "currency": "USD",
@@ -305,18 +293,17 @@ async def search(
     if not items:
         return {"source": "mock", "count": len(MOCK_SEARCH[:limit]), "results": MOCK_SEARCH[:limit]}
 
-    # ── 2. Fetch Additional Images (Multi-Image) ──
-    # نستخرج روابط المنتجات ونجلب تفاصيلها دفعة واحدة
+    # 2. Fetch Additional Images (Multi-Image)
     product_urls = [item.get("link_url", "") for item in items if item.get("link_url")]
     image_map = {}
 
-    if product_urls and len(product_urls) <= 10:  # نجيب صور إضافية فقط إذا <= 10 منتجات (للأداء)
+    if product_urls and len(product_urls) <= 10:
         product_input = {"startUrls": product_urls}
         product_items = run_apify_sync(ACTOR_PRODUCT, product_input, timeout=120)
         if product_items:
             image_map = extract_image_map(product_items)
 
-    # ── 3. Normalize & Cache ──
+    # 3. Normalize & Cache
     results = normalize_search(items, image_map)[:limit]
     set_cache("search_cache", cache_key, results)
 
@@ -330,7 +317,6 @@ async def product(
     if cached:
         return {"source": "cache", "data": cached}
 
-    # ── Apify Primary ──
     run_input = {"startUrls": [url]}
     items = run_apify_sync(ACTOR_PRODUCT, run_input, timeout=60)
 
@@ -340,7 +326,6 @@ async def product(
             set_cache("product_cache", url, data)
             return {"source": "apify", "data": data}
 
-    # ── Fallback: Mock ──
     return {"source": "mock", "data": MOCK_PRODUCT}
 
 @app.get("/stats")
@@ -370,9 +355,6 @@ async def stats():
         }
     }
 
-# ═══════════════════════════════════════════════════════════════
-# ERROR HANDLERS
-# ═══════════════════════════════════════════════════════════════
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     return JSONResponse(
